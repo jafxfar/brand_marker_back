@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     database_url: str
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str | None = None
     rate_limit_login_per_minute: int = 5
 
     s3_endpoint_url: str = "http://localhost:9000"
