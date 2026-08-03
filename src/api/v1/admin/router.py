@@ -113,8 +113,83 @@ class VerifyCompanyRequest(BaseModel):
     approved: bool = True
 
 
-class ResolveDisputeRequest(BaseModel):
-    resolution: str
+class AdminDisputeParty(BaseModel):
+    actor_id: int
+    actor_kind: str
+    display_name: str
+    company_id: int | None = None
+    company_title: str | None = None
+    user_id: int | None = None
+    email: str | None = None
+    name: str
+
+
+class AdminDisputeListItem(BaseModel):
+    id: int
+    status: str
+    contract_id: int
+    contract_title: str | None = None
+    contract_amount: float | None = None
+    currency: str | None = None
+    opened_by_actor_id: int | None = None
+    opened_by: AdminDisputeParty | None = None
+    buyer: AdminDisputeParty | None = None
+    supplier: AdminDisputeParty | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminDisputeViewCounts(BaseModel):
+    open: int
+    under_review: int
+    resolved: int
+    appealed: int
+
+
+class AdminDisputeListResponse(BaseModel):
+    items: list[AdminDisputeListItem]
+    total: int
+    page: int
+    page_size: int
+    pages: int
+    view_counts: AdminDisputeViewCounts
+
+
+class AdminDisputeDetail(AdminDisputeListItem):
+    buyer_statement: str | None = None
+    supplier_statement: str | None = None
+    resolution: str | None = None
+    resolution_note: str | None = None
+    partial_buyer_amount: float | None = None
+    resolved_at: datetime | None = None
+    buyer: AdminDisputeParty | None = None
+    supplier: AdminDisputeParty | None = None
+    contract: dict[str, Any]
+    evidence: list[dict[str, Any]]
+    files: list[dict[str, Any]]
+    messages: list[dict[str, Any]]
+    escrow: dict[str, Any]
+    timeline: list[dict[str, Any]]
+
+
+class DisputeAdminActionRequest(BaseModel):
+    action: Literal[
+        "release_funds",
+        "refund_buyer",
+        "partial_refund",
+        "request_evidence",
+        "close_case",
+    ]
+    reason: str | None = Field(default=None, max_length=2000)
+    partial_buyer_amount: float | None = Field(default=None, gt=0)
+
+
+class DisputeAdminActionResponse(BaseModel):
+    id: int
+    action: str
+    status: str
+    resolution: str | None = None
+    contract_status: str
 
 
 class AdminCatalogOwner(BaseModel):
@@ -314,6 +389,76 @@ class ProposalAdminActionResponse(BaseModel):
     action: str
     status: str
     blocked_company_id: int | None = None
+
+
+class AdminContractParty(BaseModel):
+    actor_id: int
+    actor_kind: str
+    display_name: str
+    company_id: int | None = None
+    company_title: str | None = None
+    user_id: int | None = None
+    email: str | None = None
+    name: str
+
+
+class AdminContractListItem(BaseModel):
+    id: int
+    title: str
+    status: str
+    agreed_amount: float
+    currency: str
+    payment_type: str
+    rfq_id: str
+    proposal_id: int
+    buyer: AdminContractParty | None = None
+    supplier: AdminContractParty | None = None
+    escrow_held: float
+    created_at: datetime
+
+
+class AdminContractViewCounts(BaseModel):
+    active: int
+    completed: int
+    cancelled: int
+    disputed: int
+
+
+class AdminContractListResponse(BaseModel):
+    items: list[AdminContractListItem]
+    total: int
+    page: int
+    page_size: int
+    pages: int
+    view_counts: AdminContractViewCounts
+
+
+class AdminContractDetail(AdminContractListItem):
+    description: str | None = None
+    start_date: str
+    due_date: str
+    payment_type: str
+    buyer: AdminContractParty | None = None
+    supplier: AdminContractParty | None = None
+    rfq: dict[str, Any] | None = None
+    proposal: dict[str, Any] | None = None
+    payment_plan: dict[str, Any] | None = None
+    milestones: list[dict[str, Any]]
+    files: list[dict[str, Any]]
+    messages: list[dict[str, Any]]
+    escrow: dict[str, Any]
+    history: list[dict[str, Any]]
+
+
+class ContractAdminActionRequest(BaseModel):
+    action: Literal["freeze", "cancel", "force_complete", "open_investigation"]
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class ContractAdminActionResponse(BaseModel):
+    id: int
+    action: str
+    status: str
 
 
 class AdminDashboardMetrics(BaseModel):
@@ -565,17 +710,86 @@ async def admin_apply_proposal_action(
     )
 
 
-@router.get("/disputes")
+@router.get("/contracts", response_model=AdminContractListResponse)
+async def admin_list_contracts(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    view: Literal["active", "completed", "cancelled", "disputed"] = "active",
+    query: Annotated[str | None, Query(max_length=255)] = None,
+):
+    return await AdminService(db).list_contracts(
+        page=page,
+        page_size=page_size,
+        view=view,
+        query=query,
+    )
+
+
+@router.get("/contracts/{contract_id}", response_model=AdminContractDetail)
+async def admin_get_contract(
+    contract_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    return await AdminService(db).get_contract_detail(contract_id)
+
+
+@router.post(
+    "/contracts/{contract_id}/action",
+    response_model=ContractAdminActionResponse,
+)
+async def admin_apply_contract_action(
+    contract_id: int,
+    data: ContractAdminActionRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(require_admin)],
+):
+    return await AdminService(db).apply_contract_action(
+        contract_id=contract_id,
+        action=data.action,
+        current_user=current_user,
+        reason=data.reason,
+    )
+
+
+@router.get("/disputes", response_model=AdminDisputeListResponse)
 async def admin_list_disputes(
     db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    view: Literal["open", "under_review", "resolved", "appealed"] = "open",
+    query: Annotated[str | None, Query(max_length=255)] = None,
 ):
-    return await AdminService(db).list_disputes()
+    return await AdminService(db).list_disputes(
+        page=page,
+        page_size=page_size,
+        view=view,
+        query=query,
+    )
 
 
-@router.post("/disputes/{contract_id}/resolve")
-async def admin_resolve_dispute(
-    contract_id: int,
-    data: ResolveDisputeRequest,
+@router.get("/disputes/{dispute_id}", response_model=AdminDisputeDetail)
+async def admin_get_dispute(
+    dispute_id: int,
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    return await AdminService(db).resolve_dispute(contract_id, data.resolution)
+    return await AdminService(db).get_dispute_detail(dispute_id)
+
+
+@router.post(
+    "/disputes/{dispute_id}/action",
+    response_model=DisputeAdminActionResponse,
+)
+async def admin_apply_dispute_action(
+    dispute_id: int,
+    data: DisputeAdminActionRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(require_admin)],
+):
+    return await AdminService(db).apply_dispute_action(
+        dispute_id=dispute_id,
+        action=data.action,
+        current_user=current_user,
+        reason=data.reason,
+        partial_buyer_amount=data.partial_buyer_amount,
+    )

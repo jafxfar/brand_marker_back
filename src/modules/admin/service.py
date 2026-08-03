@@ -19,11 +19,15 @@ from src.models import (
     Contract,
     ContractStatus,
     Conversation,
+    Dispute,
+    DisputeResolution,
+    DisputeStatus,
     ItemStatus,
     Notification,
     NotificationType,
     PaymentMilestone,
     PaymentMilestoneStatus,
+    PaymentPlan,
     Proposal,
     ProposalReport,
     ProposalReportStatus,
@@ -990,8 +994,14 @@ class AdminService:
             ),
             "escrow_balance": float(escrow_result.scalar_one()),
             "open_disputes": await count(
-                Contract,
-                Contract.status == ContractStatus.disputed,
+                Dispute,
+                Dispute.status.in_(
+                    [
+                        DisputeStatus.open,
+                        DisputeStatus.under_review,
+                        DisputeStatus.appealed,
+                    ]
+                ),
             ),
             "monthly_revenue": float(revenue_result.scalar_one()),
             "pending_verifications": await count(
@@ -1018,9 +1028,18 @@ class AdminService:
         ).scalars().all()
         recent_disputes = (
             await self.db.execute(
-                select(Contract)
-                .where(Contract.status == ContractStatus.disputed)
-                .order_by(Contract.created_at.desc())
+                select(Dispute)
+                .where(
+                    Dispute.status.in_(
+                        [
+                            DisputeStatus.open,
+                            DisputeStatus.under_review,
+                            DisputeStatus.appealed,
+                        ]
+                    )
+                )
+                .options(selectinload(Dispute.contract))
+                .order_by(Dispute.created_at.desc())
                 .limit(5)
             )
         ).scalars().all()
@@ -1057,13 +1076,13 @@ class AdminService:
         )
         activity.extend(
             {
-                "id": f"dispute-{contract.id}",
+                "id": f"dispute-{dispute.id}",
                 "type": "dispute",
-                "title": contract.title,
-                "description": f"Спор по контракту #{contract.id}",
-                "happened_at": contract.created_at,
+                "title": dispute.contract.title if dispute.contract else f"Спор #{dispute.id}",
+                "description": f"Спор #{dispute.id} · контракт #{dispute.contract_id}",
+                "happened_at": dispute.created_at,
             }
-            for contract in recent_disputes
+            for dispute in recent_disputes
         )
         activity.sort(key=lambda item: item["happened_at"], reverse=True)
 
@@ -1122,34 +1141,445 @@ class AdminService:
         await self.db.flush()
         return {"id": company.id, "verification_status": company.verification_status.value}
 
-    async def list_disputes(self) -> list[dict]:
-        result = await self.db.execute(
-            select(Contract)
-            .where(Contract.status == ContractStatus.disputed)
-            .options(selectinload(Contract.rfq))
-        )
-        return [
-            {
-                "contract_id": c.id,
-                "rfq_id": c.rfq_id,
-                "buyer_actor_id": c.buyer_actor_id,
-                "supplier_actor_id": c.supplier_actor_id,
-                "title": c.title,
-                "status": c.status.value,
-            }
-            for c in result.scalars().all()
-        ]
+    async def list_disputes(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        view: str = "open",
+        query: str | None = None,
+    ) -> dict:
+        search_filters: list = []
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            search_pattern = f"%{normalized_query}%"
+            search_conditions = [
+                Contract.title.ilike(search_pattern),
+                cast(Dispute.id, String).ilike(search_pattern),
+                cast(Dispute.contract_id, String).ilike(search_pattern),
+            ]
+            if normalized_query.isdigit():
+                value = int(normalized_query)
+                search_conditions.extend(
+                    [Dispute.id == value, Dispute.contract_id == value]
+                )
+            search_filters.append(or_(*search_conditions))
 
-    async def resolve_dispute(self, contract_id: int, resolution: str) -> dict:
-        result = await self.db.execute(select(Contract).where(Contract.id == contract_id))
-        contract = result.scalar_one_or_none()
-        if not contract:
-            raise NotFoundError("Contract not found")
-        if contract.status != ContractStatus.disputed:
-            raise NotFoundError("Contract is not in dispute")
-        contract.status = ContractStatus.completed if resolution == "buyer" else ContractStatus.cancelled
+        view_filter = self._dispute_view_filter(view)
+        filters = [*search_filters]
+        if view_filter is not None:
+            filters.append(view_filter)
+
+        count_stmt = (
+            select(func.count())
+            .select_from(Dispute)
+            .join(Contract, Contract.id == Dispute.contract_id)
+        )
+        if filters:
+            count_stmt = count_stmt.where(*filters)
+        total = int((await self.db.execute(count_stmt)).scalar_one())
+
+        count_values: dict[str, int] = {}
+        for count_view in ("open", "under_review", "resolved", "appealed"):
+            count_filter = self._dispute_view_filter(count_view)
+            count_filters = [*search_filters]
+            if count_filter is not None:
+                count_filters.append(count_filter)
+            view_count_stmt = (
+                select(func.count())
+                .select_from(Dispute)
+                .join(Contract, Contract.id == Dispute.contract_id)
+            )
+            if count_filters:
+                view_count_stmt = view_count_stmt.where(*count_filters)
+            count_values[count_view] = int(
+                (await self.db.execute(view_count_stmt)).scalar_one()
+            )
+
+        items_stmt = (
+            select(Dispute)
+            .join(Contract, Contract.id == Dispute.contract_id)
+            .options(selectinload(Dispute.contract))
+        )
+        if filters:
+            items_stmt = items_stmt.where(*filters)
+        items_result = await self.db.execute(
+            items_stmt.order_by(Dispute.created_at.desc(), Dispute.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = items_result.scalars().unique().all()
+        actor_ids: list[int] = []
+        for item in items:
+            if item.contract:
+                actor_ids.extend(
+                    [item.contract.buyer_actor_id, item.contract.supplier_actor_id]
+                )
+            if item.opened_by_actor_id:
+                actor_ids.append(item.opened_by_actor_id)
+        parties = await self._load_catalog_owners(actor_ids)
+
+        return {
+            "items": [
+                self._serialize_dispute_list_item(item, parties) for item in items
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total + page_size - 1) // page_size) if total else 1,
+            "view_counts": count_values,
+        }
+
+    async def get_dispute_detail(self, dispute_id: int) -> dict:
+        result = await self.db.execute(
+            select(Dispute)
+            .where(Dispute.id == dispute_id)
+            .options(
+                selectinload(Dispute.evidence),
+                selectinload(Dispute.contract)
+                .selectinload(Contract.payment_plan)
+                .selectinload(PaymentPlan.milestones),
+                selectinload(Dispute.contract).selectinload(Contract.files),
+                selectinload(Dispute.contract)
+                .selectinload(Contract.conversation)
+                .selectinload(Conversation.messages),
+                selectinload(Dispute.contract).selectinload(Contract.rfq),
+                selectinload(Dispute.contract).selectinload(Contract.proposal),
+            )
+        )
+        dispute = result.scalar_one_or_none()
+        if not dispute or not dispute.contract:
+            raise NotFoundError("Dispute not found")
+
+        contract = dispute.contract
+        actor_ids = [contract.buyer_actor_id, contract.supplier_actor_id]
+        if dispute.opened_by_actor_id:
+            actor_ids.append(dispute.opened_by_actor_id)
+        parties = await self._load_catalog_owners(actor_ids)
+
+        history_result = await self.db.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.resource_type == "dispute",
+                AuditLog.resource_id == str(dispute.id),
+            )
+            .options(selectinload(AuditLog.user))
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(50)
+        )
+        history = history_result.scalars().all()
+
+        messages = []
+        if contract.conversation:
+            for message in contract.conversation.messages:
+                messages.append(
+                    {
+                        "id": message.id,
+                        "sender_id": message.sender_id,
+                        "text": message.text,
+                        "created_at": message.created_at,
+                    }
+                )
+        messages.sort(key=lambda item: item["created_at"], reverse=True)
+
+        milestones = (
+            list(contract.payment_plan.milestones) if contract.payment_plan else []
+        )
+        escrow = self._escrow_summary(milestones, contract.currency.value)
+
+        return {
+            **self._serialize_dispute_list_item(dispute, parties),
+            "buyer_statement": dispute.buyer_statement,
+            "supplier_statement": dispute.supplier_statement,
+            "resolution": dispute.resolution.value if dispute.resolution else None,
+            "resolution_note": dispute.resolution_note,
+            "partial_buyer_amount": dispute.partial_buyer_amount,
+            "resolved_at": dispute.resolved_at,
+            "buyer": parties.get(contract.buyer_actor_id),
+            "supplier": parties.get(contract.supplier_actor_id),
+            "contract": {
+                "id": contract.id,
+                "title": contract.title,
+                "status": contract.status.value,
+                "agreed_amount": contract.agreed_amount,
+                "currency": contract.currency.value,
+                "rfq_id": contract.rfq_id,
+                "proposal_id": contract.proposal_id,
+                "description": contract.description,
+            },
+            "evidence": [
+                {
+                    "id": item.id,
+                    "file_name": item.file_name,
+                    "file_url": item.file_url,
+                    "file_type": item.file_type,
+                    "note": item.note,
+                    "uploaded_by_actor_id": item.uploaded_by_actor_id,
+                    "created_at": item.created_at,
+                }
+                for item in sorted(
+                    dispute.evidence, key=lambda value: value.created_at, reverse=True
+                )
+            ],
+            "files": [
+                {
+                    "id": file.id,
+                    "file_name": file.file_name,
+                    "file_url": file.file_url,
+                    "file_type": file.file_type,
+                    "uploaded_by": file.uploaded_by,
+                    "created_at": file.created_at,
+                }
+                for file in sorted(
+                    contract.files, key=lambda value: value.created_at, reverse=True
+                )
+            ],
+            "messages": messages,
+            "escrow": escrow,
+            "timeline": [
+                {
+                    "id": entry.id,
+                    "action": entry.action,
+                    "details": entry.details or {},
+                    "created_at": entry.created_at,
+                    "actor": (
+                        {
+                            "id": entry.user.id,
+                            "email": entry.user.email,
+                            "name": f"{entry.user.first_name} {entry.user.last_name}".strip(),
+                        }
+                        if entry.user
+                        else None
+                    ),
+                }
+                for entry in history
+            ],
+        }
+
+    async def apply_dispute_action(
+        self,
+        dispute_id: int,
+        action: str,
+        current_user: User,
+        reason: str | None = None,
+        partial_buyer_amount: float | None = None,
+    ) -> dict:
+        result = await self.db.execute(
+            select(Dispute)
+            .where(Dispute.id == dispute_id)
+            .options(
+                selectinload(Dispute.contract)
+                .selectinload(Contract.payment_plan)
+                .selectinload(PaymentPlan.milestones),
+            )
+        )
+        dispute = result.scalar_one_or_none()
+        if not dispute or not dispute.contract:
+            raise NotFoundError("Dispute not found")
+
+        allowed = {
+            "release_funds",
+            "refund_buyer",
+            "partial_refund",
+            "request_evidence",
+            "close_case",
+        }
+        if action not in allowed:
+            raise ValidationError("Unsupported dispute action")
+        if not (reason and reason.strip()):
+            raise ValidationError("Reason is required for this action")
+        if dispute.status == DisputeStatus.resolved:
+            raise ConflictError("Dispute is already resolved")
+
+        contract = dispute.contract
+        milestones = (
+            list(contract.payment_plan.milestones) if contract.payment_plan else []
+        )
+        movable = {
+            PaymentMilestoneStatus.funded,
+            PaymentMilestoneStatus.in_progress,
+            PaymentMilestoneStatus.submitted,
+            PaymentMilestoneStatus.approved,
+            PaymentMilestoneStatus.awaiting_payment,
+            PaymentMilestoneStatus.disputed,
+        }
+        previous_status = dispute.status.value
+        now = datetime.now(timezone.utc)
+
+        if action == "request_evidence":
+            dispute.status = DisputeStatus.under_review
+        elif action == "release_funds":
+            for milestone in milestones:
+                if milestone.status in movable:
+                    milestone.status = PaymentMilestoneStatus.released
+            dispute.status = DisputeStatus.resolved
+            dispute.resolution = DisputeResolution.release_funds
+            dispute.resolution_note = reason.strip()
+            dispute.resolved_at = now
+            dispute.resolved_by_id = current_user.id
+            contract.status = ContractStatus.completed
+        elif action == "refund_buyer":
+            for milestone in milestones:
+                if milestone.status in movable:
+                    milestone.status = PaymentMilestoneStatus.refunded
+            dispute.status = DisputeStatus.resolved
+            dispute.resolution = DisputeResolution.refund_buyer
+            dispute.resolution_note = reason.strip()
+            dispute.resolved_at = now
+            dispute.resolved_by_id = current_user.id
+            contract.status = ContractStatus.cancelled
+        elif action == "partial_refund":
+            if partial_buyer_amount is None or partial_buyer_amount <= 0:
+                raise ValidationError("partial_buyer_amount is required")
+            pool = sum(m.amount for m in milestones if m.status in movable)
+            if partial_buyer_amount > pool + 1e-6:
+                raise ValidationError("partial_buyer_amount exceeds escrow pool")
+            self._apply_partial_refund(milestones, movable, partial_buyer_amount)
+            dispute.status = DisputeStatus.resolved
+            dispute.resolution = DisputeResolution.partial_refund
+            dispute.resolution_note = reason.strip()
+            dispute.partial_buyer_amount = partial_buyer_amount
+            dispute.resolved_at = now
+            dispute.resolved_by_id = current_user.id
+            contract.status = ContractStatus.completed
+        elif action == "close_case":
+            dispute.status = DisputeStatus.resolved
+            dispute.resolution = DisputeResolution.close_case
+            dispute.resolution_note = reason.strip()
+            dispute.resolved_at = now
+            dispute.resolved_by_id = current_user.id
+            contract.status = ContractStatus.completed
+
+        for actor_id in (contract.buyer_actor_id, contract.supplier_actor_id):
+            user_id = await self._resolve_catalog_owner_user_id(actor_id)
+            if not user_id:
+                continue
+            title, body = self._dispute_action_notification(
+                action, contract.title, reason
+            )
+            self.db.add(
+                Notification(
+                    user_id=user_id,
+                    company_id=None,
+                    type=NotificationType.system,
+                    title=title,
+                    body=body,
+                    href=f"/customer/contracts/{contract.id}",
+                )
+            )
+
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.dispute.{action}",
+            resource_type="dispute",
+            resource_id=str(dispute.id),
+            details={
+                "reason": reason.strip() if reason else None,
+                "previous_status": previous_status,
+                "status": dispute.status.value,
+                "partial_buyer_amount": partial_buyer_amount,
+                "contract_id": contract.id,
+            },
+        )
         await self.db.flush()
-        return {"contract_id": contract.id, "status": contract.status.value, "resolution": resolution}
+        return {
+            "id": dispute.id,
+            "action": action,
+            "status": dispute.status.value,
+            "resolution": dispute.resolution.value if dispute.resolution else None,
+            "contract_status": contract.status.value,
+        }
+
+    @staticmethod
+    def _dispute_view_filter(view: str):
+        if view == "open":
+            return Dispute.status == DisputeStatus.open
+        if view == "under_review":
+            return Dispute.status == DisputeStatus.under_review
+        if view == "resolved":
+            return Dispute.status == DisputeStatus.resolved
+        if view == "appealed":
+            return Dispute.status == DisputeStatus.appealed
+        return None
+
+    @staticmethod
+    def _apply_partial_refund(
+        milestones: list,
+        movable: set,
+        buyer_amount: float,
+    ) -> None:
+        remaining_refund = buyer_amount
+        for milestone in milestones:
+            if milestone.status not in movable:
+                continue
+            if remaining_refund <= 1e-9:
+                milestone.status = PaymentMilestoneStatus.released
+                continue
+            if milestone.amount <= remaining_refund + 1e-9:
+                milestone.status = PaymentMilestoneStatus.refunded
+                remaining_refund -= milestone.amount
+            else:
+                if remaining_refund >= milestone.amount / 2:
+                    milestone.status = PaymentMilestoneStatus.refunded
+                else:
+                    milestone.status = PaymentMilestoneStatus.released
+                remaining_refund = 0
+
+    def _serialize_dispute_list_item(
+        self,
+        dispute: Dispute,
+        parties: dict[int, dict],
+    ) -> dict:
+        contract = dispute.contract
+        return {
+            "id": dispute.id,
+            "status": dispute.status.value,
+            "contract_id": dispute.contract_id,
+            "contract_title": contract.title if contract else None,
+            "contract_amount": contract.agreed_amount if contract else None,
+            "currency": contract.currency.value if contract else None,
+            "opened_by_actor_id": dispute.opened_by_actor_id,
+            "opened_by": (
+                parties.get(dispute.opened_by_actor_id)
+                if dispute.opened_by_actor_id
+                else None
+            ),
+            "buyer": parties.get(contract.buyer_actor_id) if contract else None,
+            "supplier": parties.get(contract.supplier_actor_id) if contract else None,
+            "created_at": dispute.created_at,
+            "updated_at": dispute.updated_at,
+        }
+
+    @staticmethod
+    def _dispute_action_notification(
+        action: str, contract_title: str, reason: str | None
+    ) -> tuple[str, str]:
+        messages = {
+            "release_funds": (
+                "Спор: выплата поставщику",
+                f"По спору по контракту «{contract_title}» средства выплачены поставщику.",
+            ),
+            "refund_buyer": (
+                "Спор: возврат покупателю",
+                f"По спору по контракту «{contract_title}» средства возвращены покупателю.",
+            ),
+            "partial_refund": (
+                "Спор: частичный возврат",
+                f"По спору по контракту «{contract_title}» выполнен частичный возврат.",
+            ),
+            "request_evidence": (
+                "Спор: запрошены доказательства",
+                f"Администратор запросил дополнительные доказательства по контракту «{contract_title}».",
+            ),
+            "close_case": (
+                "Спор закрыт",
+                f"Спор по контракту «{contract_title}» закрыт администратором.",
+            ),
+        }
+        title, body = messages[action]
+        if reason:
+            body = f"{body} Причина: {reason.strip()}"
+        return title, body
 
     async def list_rfqs(
         self,
@@ -1942,6 +2372,452 @@ class AdminService:
             "warn_buyer": (
                 "Предупреждение по заявке",
                 f"Администратор отправил предупреждение по заявке «{rfq_title}».",
+            ),
+        }
+        title, body = messages[action]
+        if reason:
+            body = f"{body} Причина: {reason.strip()}"
+        return title, body
+
+    async def list_contracts(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        view: str = "active",
+        query: str | None = None,
+    ) -> dict:
+        search_filters: list = []
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            search_pattern = f"%{normalized_query}%"
+            search_conditions = [
+                Contract.title.ilike(search_pattern),
+                Contract.description.ilike(search_pattern),
+                Contract.rfq_id.ilike(search_pattern),
+                cast(Contract.id, String).ilike(search_pattern),
+            ]
+            if normalized_query.isdigit():
+                search_conditions.append(Contract.id == int(normalized_query))
+            search_filters.append(or_(*search_conditions))
+
+        view_filter = self._contract_view_filter(view)
+        filters = [*search_filters]
+        if view_filter is not None:
+            filters.append(view_filter)
+
+        count_stmt = select(func.count()).select_from(Contract)
+        if filters:
+            count_stmt = count_stmt.where(*filters)
+        total = int((await self.db.execute(count_stmt)).scalar_one())
+
+        count_values: dict[str, int] = {}
+        for count_view in ("active", "completed", "cancelled", "disputed"):
+            count_filter = self._contract_view_filter(count_view)
+            count_filters = [*search_filters]
+            if count_filter is not None:
+                count_filters.append(count_filter)
+            view_count_stmt = select(func.count()).select_from(Contract)
+            if count_filters:
+                view_count_stmt = view_count_stmt.where(*count_filters)
+            count_values[count_view] = int(
+                (await self.db.execute(view_count_stmt)).scalar_one()
+            )
+
+        items_stmt = select(Contract).options(
+            selectinload(Contract.payment_plan).selectinload(PaymentPlan.milestones),
+            selectinload(Contract.rfq),
+        )
+        if filters:
+            items_stmt = items_stmt.where(*filters)
+        items_result = await self.db.execute(
+            items_stmt.order_by(Contract.created_at.desc(), Contract.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = items_result.scalars().unique().all()
+        actor_ids = [c.buyer_actor_id for c in items] + [c.supplier_actor_id for c in items]
+        parties = await self._load_catalog_owners(actor_ids)
+
+        return {
+            "items": [
+                self._serialize_contract_list_item(
+                    item,
+                    parties.get(item.buyer_actor_id),
+                    parties.get(item.supplier_actor_id),
+                )
+                for item in items
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total + page_size - 1) // page_size) if total else 1,
+            "view_counts": count_values,
+        }
+
+    async def get_contract_detail(self, contract_id: int) -> dict:
+        result = await self.db.execute(
+            select(Contract)
+            .where(Contract.id == contract_id)
+            .options(
+                selectinload(Contract.payment_plan).selectinload(PaymentPlan.milestones),
+                selectinload(Contract.files),
+                selectinload(Contract.conversation).selectinload(Conversation.messages),
+                selectinload(Contract.rfq),
+                selectinload(Contract.proposal),
+            )
+        )
+        contract = result.scalar_one_or_none()
+        if not contract:
+            raise NotFoundError("Contract not found")
+
+        parties = await self._load_catalog_owners(
+            [contract.buyer_actor_id, contract.supplier_actor_id]
+        )
+        buyer = parties.get(contract.buyer_actor_id)
+        supplier = parties.get(contract.supplier_actor_id)
+
+        history_result = await self.db.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.resource_type == "contract",
+                AuditLog.resource_id == str(contract.id),
+            )
+            .options(selectinload(AuditLog.user))
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(50)
+        )
+        history = history_result.scalars().all()
+
+        messages = []
+        if contract.conversation:
+            for message in contract.conversation.messages:
+                messages.append(
+                    {
+                        "id": message.id,
+                        "sender_id": message.sender_id,
+                        "text": message.text,
+                        "created_at": message.created_at,
+                    }
+                )
+        messages.sort(key=lambda item: item["created_at"], reverse=True)
+
+        milestones = (
+            list(contract.payment_plan.milestones) if contract.payment_plan else []
+        )
+        escrow = self._escrow_summary(milestones, contract.currency.value)
+
+        return {
+            **self._serialize_contract_list_item(contract, buyer, supplier),
+            "description": contract.description,
+            "start_date": contract.start_date,
+            "due_date": contract.due_date,
+            "payment_type": contract.payment_type.value,
+            "buyer": buyer,
+            "supplier": supplier,
+            "rfq": (
+                {
+                    "id": contract.rfq.id,
+                    "title": contract.rfq.title,
+                    "status": contract.rfq.status.value,
+                }
+                if contract.rfq
+                else None
+            ),
+            "proposal": (
+                {
+                    "id": contract.proposal.id,
+                    "price": contract.proposal.price,
+                    "status": contract.proposal.status.value,
+                }
+                if contract.proposal
+                else None
+            ),
+            "payment_plan": (
+                {
+                    "id": contract.payment_plan.id,
+                    "payment_type": contract.payment_plan.payment_type.value,
+                }
+                if contract.payment_plan
+                else None
+            ),
+            "milestones": [
+                {
+                    "id": milestone.id,
+                    "title": milestone.title,
+                    "percentage": milestone.percentage,
+                    "amount": milestone.amount,
+                    "trigger": milestone.trigger,
+                    "status": milestone.status.value,
+                }
+                for milestone in sorted(milestones, key=lambda value: value.id)
+            ],
+            "files": [
+                {
+                    "id": file.id,
+                    "file_name": file.file_name,
+                    "file_url": file.file_url,
+                    "file_type": file.file_type,
+                    "uploaded_by": file.uploaded_by,
+                    "created_at": file.created_at,
+                }
+                for file in sorted(
+                    contract.files, key=lambda value: value.created_at, reverse=True
+                )
+            ],
+            "messages": messages,
+            "escrow": escrow,
+            "history": [
+                {
+                    "id": entry.id,
+                    "action": entry.action,
+                    "details": entry.details or {},
+                    "created_at": entry.created_at,
+                    "actor": (
+                        {
+                            "id": entry.user.id,
+                            "email": entry.user.email,
+                            "name": f"{entry.user.first_name} {entry.user.last_name}".strip(),
+                        }
+                        if entry.user
+                        else None
+                    ),
+                }
+                for entry in history
+            ],
+        }
+
+    async def apply_contract_action(
+        self,
+        contract_id: int,
+        action: str,
+        current_user: User,
+        reason: str | None = None,
+    ) -> dict:
+        result = await self.db.execute(
+            select(Contract)
+            .where(Contract.id == contract_id)
+            .options(
+                selectinload(Contract.payment_plan).selectinload(PaymentPlan.milestones),
+            )
+        )
+        contract = result.scalar_one_or_none()
+        if not contract:
+            raise NotFoundError("Contract not found")
+
+        allowed = {"freeze", "cancel", "force_complete", "open_investigation"}
+        if action not in allowed:
+            raise ValidationError("Unsupported contract action")
+        if action == "force_complete" and current_user.role == UserRole.moderator:
+            raise ForbiddenError("Moderator cannot force-complete contracts")
+        if action in {"cancel", "force_complete", "open_investigation"} and not (
+            reason and reason.strip()
+        ):
+            raise ValidationError("Reason is required for this action")
+
+        previous_status = contract.status.value
+        milestones = (
+            list(contract.payment_plan.milestones) if contract.payment_plan else []
+        )
+        freeze_statuses = {
+            PaymentMilestoneStatus.funded,
+            PaymentMilestoneStatus.in_progress,
+            PaymentMilestoneStatus.submitted,
+            PaymentMilestoneStatus.approved,
+            PaymentMilestoneStatus.awaiting_payment,
+        }
+
+        if action == "freeze":
+            for milestone in milestones:
+                if milestone.status in freeze_statuses:
+                    milestone.status = PaymentMilestoneStatus.disputed
+        elif action == "cancel":
+            if contract.status in {ContractStatus.completed, ContractStatus.cancelled}:
+                raise ConflictError("Contract is already closed")
+            contract.status = ContractStatus.cancelled
+        elif action == "force_complete":
+            if contract.status == ContractStatus.completed:
+                raise ConflictError("Contract is already completed")
+            contract.status = ContractStatus.completed
+            for milestone in milestones:
+                if milestone.status == PaymentMilestoneStatus.funded:
+                    milestone.status = PaymentMilestoneStatus.released
+        elif action == "open_investigation":
+            if contract.status in {ContractStatus.completed, ContractStatus.cancelled}:
+                raise ConflictError("Cannot open investigation on a closed contract")
+            active = await self.db.execute(
+                select(Dispute).where(
+                    Dispute.contract_id == contract.id,
+                    Dispute.status.in_(
+                        [
+                            DisputeStatus.open,
+                            DisputeStatus.under_review,
+                            DisputeStatus.appealed,
+                        ]
+                    ),
+                )
+            )
+            if active.scalar_one_or_none():
+                raise ConflictError("An active dispute already exists for this contract")
+            had_resolved = (
+                await self.db.execute(
+                    select(Dispute.id)
+                    .where(
+                        Dispute.contract_id == contract.id,
+                        Dispute.status == DisputeStatus.resolved,
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            dispute = Dispute(
+                contract_id=contract.id,
+                status=(
+                    DisputeStatus.appealed if had_resolved else DisputeStatus.open
+                ),
+                opened_by_actor_id=None,
+                buyer_statement=reason.strip() if reason else None,
+            )
+            self.db.add(dispute)
+            contract.status = ContractStatus.disputed
+            await self.db.flush()
+            await log_audit(
+                self.db,
+                user_id=current_user.id,
+                action="dispute.open",
+                resource_type="dispute",
+                resource_id=str(dispute.id),
+                details={
+                    "contract_id": contract.id,
+                    "status": dispute.status.value,
+                    "reason": reason.strip() if reason else None,
+                    "source": "admin.open_investigation",
+                },
+            )
+
+        for actor_id in (contract.buyer_actor_id, contract.supplier_actor_id):
+            user_id = await self._resolve_catalog_owner_user_id(actor_id)
+            if not user_id:
+                continue
+            title, body = self._contract_action_notification(
+                action, contract.title, reason
+            )
+            self.db.add(
+                Notification(
+                    user_id=user_id,
+                    company_id=None,
+                    type=NotificationType.system,
+                    title=title,
+                    body=body,
+                    href=f"/customer/contracts/{contract.id}",
+                )
+            )
+
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.contract.{action}",
+            resource_type="contract",
+            resource_id=str(contract.id),
+            details={
+                "reason": reason.strip() if reason else None,
+                "previous_status": previous_status,
+                "status": contract.status.value,
+            },
+        )
+        await self.db.flush()
+        return {
+            "id": contract.id,
+            "action": action,
+            "status": contract.status.value,
+        }
+
+    @staticmethod
+    def _contract_view_filter(view: str):
+        if view == "active":
+            return Contract.status.in_(
+                [
+                    ContractStatus.pending_payment,
+                    ContractStatus.active,
+                    ContractStatus.delivered,
+                ]
+            )
+        if view == "completed":
+            return Contract.status == ContractStatus.completed
+        if view == "cancelled":
+            return Contract.status == ContractStatus.cancelled
+        if view == "disputed":
+            return Contract.status == ContractStatus.disputed
+        return None
+
+    @staticmethod
+    def _escrow_summary(milestones: list, currency: str) -> dict:
+        held_statuses = {
+            PaymentMilestoneStatus.funded,
+            PaymentMilestoneStatus.submitted,
+            PaymentMilestoneStatus.in_progress,
+            PaymentMilestoneStatus.awaiting_payment,
+        }
+        held = released = disputed = 0.0
+        for milestone in milestones:
+            if milestone.status == PaymentMilestoneStatus.released:
+                released += milestone.amount
+            elif milestone.status == PaymentMilestoneStatus.disputed:
+                disputed += milestone.amount
+            elif milestone.status in held_statuses:
+                held += milestone.amount
+        return {
+            "held": held,
+            "released": released,
+            "disputed": disputed,
+            "currency": currency,
+        }
+
+    def _serialize_contract_list_item(
+        self,
+        contract: Contract,
+        buyer: dict | None,
+        supplier: dict | None,
+    ) -> dict:
+        milestones = (
+            list(contract.payment_plan.milestones)
+            if getattr(contract, "payment_plan", None) and contract.payment_plan
+            else []
+        )
+        escrow = self._escrow_summary(milestones, contract.currency.value)
+        return {
+            "id": contract.id,
+            "title": contract.title,
+            "status": contract.status.value,
+            "agreed_amount": contract.agreed_amount,
+            "currency": contract.currency.value,
+            "payment_type": contract.payment_type.value,
+            "rfq_id": contract.rfq_id,
+            "proposal_id": contract.proposal_id,
+            "buyer": buyer,
+            "supplier": supplier,
+            "escrow_held": escrow["held"],
+            "created_at": contract.created_at,
+        }
+
+    @staticmethod
+    def _contract_action_notification(
+        action: str, contract_title: str, reason: str | None
+    ) -> tuple[str, str]:
+        messages = {
+            "freeze": (
+                "Escrow заморожен",
+                f"Администратор заморозил средства по контракту «{contract_title}».",
+            ),
+            "cancel": (
+                "Контракт отменён",
+                f"Контракт «{contract_title}» отменён администратором.",
+            ),
+            "force_complete": (
+                "Контракт принудительно завершён",
+                f"Контракт «{contract_title}» принудительно завершён администратором.",
+            ),
+            "open_investigation": (
+                "Открыто расследование",
+                f"По контракту «{contract_title}» открыто административное расследование.",
             ),
         }
         title, body = messages[action]

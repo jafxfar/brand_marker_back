@@ -6,11 +6,14 @@ from sqlalchemy.orm import selectinload
 
 from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from src.models import (
+    Actor,
     Contract,
     ContractFile,
     ContractStatus,
     Conversation,
     Currency,
+    Dispute,
+    DisputeStatus,
     Message,
     PaymentMilestone,
     PaymentMilestoneStatus,
@@ -25,6 +28,7 @@ from src.models import (
 )
 from src.modules.contracts.schemas import DisputeRequest, MessageCreate, WorkSubmissionCreate
 from src.shared.serializers import contract_to_schema
+from src.utils.audit import log_audit
 
 
 def _default_milestones(contract: Contract, payment_type: PaymentType) -> list[dict]:
@@ -303,8 +307,65 @@ class ContractService:
         contract = await self._load(contract_id)
         if contract.buyer_actor_id != actor_id and contract.supplier_actor_id != actor_id:
             raise ForbiddenError("Access denied")
+
+        active = await self.db.execute(
+            select(Dispute).where(
+                Dispute.contract_id == contract_id,
+                Dispute.status.in_(
+                    [
+                        DisputeStatus.open,
+                        DisputeStatus.under_review,
+                        DisputeStatus.appealed,
+                    ]
+                ),
+            )
+        )
+        if active.scalar_one_or_none():
+            raise ConflictError("An active dispute already exists for this contract")
+
+        had_resolved = (
+            await self.db.execute(
+                select(Dispute.id)
+                .where(
+                    Dispute.contract_id == contract_id,
+                    Dispute.status == DisputeStatus.resolved,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+        buyer_statement = data.reason if actor_id == contract.buyer_actor_id else None
+        supplier_statement = (
+            data.reason if actor_id == contract.supplier_actor_id else None
+        )
+        dispute = Dispute(
+            contract_id=contract.id,
+            status=DisputeStatus.appealed if had_resolved else DisputeStatus.open,
+            opened_by_actor_id=actor_id,
+            buyer_statement=buyer_statement,
+            supplier_statement=supplier_statement,
+        )
+        self.db.add(dispute)
         contract.status = ContractStatus.disputed
         if contract.rfq:
             contract.rfq.status = RfqStatus.disputed
+        await self.db.flush()
+
+        actor = (
+            await self.db.execute(select(Actor).where(Actor.id == actor_id))
+        ).scalar_one_or_none()
+        await log_audit(
+            self.db,
+            user_id=actor.user_id if actor else None,
+            action="dispute.open",
+            resource_type="dispute",
+            resource_id=str(dispute.id),
+            details={
+                "contract_id": contract.id,
+                "status": dispute.status.value,
+                "reason": data.reason,
+                "opened_by_actor_id": actor_id,
+            },
+        )
         await self.db.flush()
         return contract_to_schema(await self._load(contract_id))

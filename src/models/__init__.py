@@ -551,6 +551,7 @@ class Contract(Base):
     conversation: Mapped["Conversation | None"] = relationship(back_populates="contract", uselist=False)
     files: Mapped[list["ContractFile"]] = relationship(back_populates="contract")
     submissions: Mapped[list["WorkSubmission"]] = relationship(back_populates="contract")
+    disputes: Mapped[list["Dispute"]] = relationship(back_populates="contract")
 
 
 class PaymentMilestoneStatus(str, enum.Enum):
@@ -649,6 +650,84 @@ class ContractFile(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     contract: Mapped["Contract"] = relationship(back_populates="files")
+
+
+class DisputeStatus(str, enum.Enum):
+    open = "open"
+    under_review = "under_review"
+    resolved = "resolved"
+    appealed = "appealed"
+
+
+class DisputeResolution(str, enum.Enum):
+    release_funds = "release_funds"
+    refund_buyer = "refund_buyer"
+    partial_refund = "partial_refund"
+    close_case = "close_case"
+
+
+class Dispute(Base):
+    __tablename__ = "disputes"
+    __table_args__ = (
+        Index(
+            "uq_dispute_active_contract",
+            "contract_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('open', 'under_review', 'appealed')"
+            ),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    contract_id: Mapped[int] = mapped_column(ForeignKey("contracts.id"), index=True)
+    status: Mapped[DisputeStatus] = mapped_column(
+        Enum(DisputeStatus, name="dispute_status"),
+        default=DisputeStatus.open,
+    )
+    opened_by_actor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("actors.id"), nullable=True, index=True
+    )
+    buyer_statement: Mapped[str | None] = mapped_column(Text, nullable=True)
+    supplier_statement: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolution: Mapped[DisputeResolution | None] = mapped_column(
+        Enum(DisputeResolution, name="dispute_resolution"),
+        nullable=True,
+    )
+    resolution_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    partial_buyer_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    resolved_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    contract: Mapped["Contract"] = relationship(back_populates="disputes")
+    evidence: Mapped[list["DisputeEvidence"]] = relationship(back_populates="dispute")
+    opened_by: Mapped["Actor | None"] = relationship(foreign_keys=[opened_by_actor_id])
+    resolved_by: Mapped["User | None"] = relationship(foreign_keys=[resolved_by_id])
+
+
+class DisputeEvidence(Base):
+    __tablename__ = "dispute_evidence"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dispute_id: Mapped[int] = mapped_column(ForeignKey("disputes.id"), index=True)
+    uploaded_by_actor_id: Mapped[int] = mapped_column(ForeignKey("actors.id"), index=True)
+    file_name: Mapped[str] = mapped_column(String(255))
+    file_url: Mapped[str] = mapped_column(String(500))
+    file_type: Mapped[str] = mapped_column(String(100))
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    dispute: Mapped["Dispute"] = relationship(back_populates="evidence")
 
 
 class WorkSubmissionStatus(str, enum.Enum):

@@ -137,6 +137,7 @@ async def ensure_schema() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_admin_rfq_proposal_schema_sync)
+        await conn.run_sync(_ensure_admin_disputes_schema_sync)
     logger.info("Database schema ensured via metadata.create_all")
 
 
@@ -237,6 +238,95 @@ def _ensure_admin_rfq_proposal_schema_sync(sync_conn) -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS uq_proposal_open_report
             ON proposal_reports (proposal_id, reporter_user_id)
             WHERE status = 'open';
+            """
+        )
+    )
+
+
+def _ensure_admin_disputes_schema_sync(sync_conn) -> None:
+    for type_name, values in (
+        (
+            "dispute_status",
+            ("open", "under_review", "resolved", "appealed"),
+        ),
+        (
+            "dispute_resolution",
+            ("release_funds", "refund_buyer", "partial_refund", "close_case"),
+        ),
+    ):
+        values_sql = ", ".join(f"'{value}'" for value in values)
+        sync_conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    CREATE TYPE {type_name} AS ENUM ({values_sql});
+                EXCEPTION
+                    WHEN duplicate_object THEN NULL;
+                END
+                $$;
+                """
+            )
+        )
+
+    sync_conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS disputes (
+                id SERIAL PRIMARY KEY,
+                contract_id INTEGER NOT NULL REFERENCES contracts(id),
+                status dispute_status NOT NULL DEFAULT 'open',
+                opened_by_actor_id INTEGER REFERENCES actors(id),
+                buyer_statement TEXT,
+                supplier_statement TEXT,
+                resolution dispute_resolution,
+                resolution_note TEXT,
+                partial_buyer_amount DOUBLE PRECISION,
+                resolved_at TIMESTAMPTZ,
+                resolved_by_id INTEGER REFERENCES users(id),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+    )
+    sync_conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_disputes_contract_id ON disputes (contract_id);
+            """
+        )
+    )
+    sync_conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_dispute_active_contract
+            ON disputes (contract_id)
+            WHERE status IN ('open', 'under_review', 'appealed');
+            """
+        )
+    )
+    sync_conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_evidence (
+                id SERIAL PRIMARY KEY,
+                dispute_id INTEGER NOT NULL REFERENCES disputes(id),
+                uploaded_by_actor_id INTEGER NOT NULL REFERENCES actors(id),
+                file_name VARCHAR(255) NOT NULL,
+                file_url VARCHAR(500) NOT NULL,
+                file_type VARCHAR(100) NOT NULL,
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+    )
+    sync_conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_dispute_evidence_dispute_id
+            ON dispute_evidence (dispute_id);
             """
         )
     )
