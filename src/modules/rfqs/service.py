@@ -80,7 +80,10 @@ class RfqService:
         return rfq
 
     async def list_for_buyer(self, actor_id: int, tab: str | None = None) -> list:
-        stmt = select(Rfq).where(Rfq.actor_id == actor_id).options(
+        stmt = select(Rfq).where(
+            Rfq.actor_id == actor_id,
+            Rfq.status != RfqStatus.archived,
+        ).options(
             selectinload(Rfq.attachments), selectinload(Rfq.invited_suppliers)
         )
         if tab and tab in BUYER_TAB_STATUSES:

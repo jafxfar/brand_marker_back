@@ -136,7 +136,110 @@ def _migrate_legacy_actor_fks_sync(sync_conn) -> None:
 async def ensure_schema() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_admin_rfq_proposal_schema_sync)
     logger.info("Database schema ensured via metadata.create_all")
+
+
+def _ensure_admin_rfq_proposal_schema_sync(sync_conn) -> None:
+    sync_conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_enum
+                    JOIN pg_type ON pg_type.oid = pg_enum.enumtypid
+                    WHERE pg_type.typname = 'rfq_status'
+                      AND pg_enum.enumlabel = 'archived'
+                ) THEN
+                    ALTER TYPE rfq_status ADD VALUE 'archived';
+                END IF;
+            END
+            $$;
+            """
+        )
+    )
+
+    for type_name, values in (
+        (
+            "rfq_report_reason",
+            ("misleading", "prohibited", "spam", "copyright", "other"),
+        ),
+        (
+            "proposal_report_reason",
+            ("misleading", "prohibited", "spam", "copyright", "other"),
+        ),
+        ("rfq_report_status", ("open", "resolved", "dismissed")),
+        ("proposal_report_status", ("open", "resolved", "dismissed")),
+    ):
+        values_sql = ", ".join(f"'{value}'" for value in values)
+        sync_conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    CREATE TYPE {type_name} AS ENUM ({values_sql});
+                EXCEPTION
+                    WHEN duplicate_object THEN NULL;
+                END
+                $$;
+                """
+            )
+        )
+
+    sync_conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS rfq_reports (
+                id SERIAL PRIMARY KEY,
+                rfq_id VARCHAR(36) NOT NULL REFERENCES rfqs(id),
+                reporter_user_id INTEGER NOT NULL REFERENCES users(id),
+                reason rfq_report_reason NOT NULL,
+                details TEXT,
+                status rfq_report_status NOT NULL DEFAULT 'open',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMPTZ,
+                resolved_by_id INTEGER REFERENCES users(id)
+            );
+            """
+        )
+    )
+    sync_conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_rfq_open_report
+            ON rfq_reports (rfq_id, reporter_user_id)
+            WHERE status = 'open';
+            """
+        )
+    )
+    sync_conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS proposal_reports (
+                id SERIAL PRIMARY KEY,
+                proposal_id INTEGER NOT NULL REFERENCES proposals(id),
+                reporter_user_id INTEGER NOT NULL REFERENCES users(id),
+                reason proposal_report_reason NOT NULL,
+                details TEXT,
+                status proposal_report_status NOT NULL DEFAULT 'open',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMPTZ,
+                resolved_by_id INTEGER REFERENCES users(id)
+            );
+            """
+        )
+    )
+    sync_conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_proposal_open_report
+            ON proposal_reports (proposal_id, reporter_user_id)
+            WHERE status = 'open';
+            """
+        )
+    )
 
 
 async def migrate_legacy_actor_fks() -> None:

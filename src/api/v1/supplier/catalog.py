@@ -29,7 +29,7 @@ async def create_item(
 ):
     from src.modules.subscription.service import SubscriptionService
 
-    if data.status == "active":
+    if data.status in {"active", "pending_review"}:
         await SubscriptionService(db).check_catalog_limit(ctx.user.id, ctx.actor.id)
     return await CatalogItemService(db).create(ctx.actor.id, data)
 
@@ -62,7 +62,9 @@ async def publish_item(
     from src.modules.subscription.service import SubscriptionService
 
     await SubscriptionService(db).check_catalog_limit(ctx.user.id, ctx.actor.id)
-    return await CatalogItemService(db).set_status(item_id, ctx.actor.id, ItemStatus.active)
+    return await CatalogItemService(db).set_status(
+        item_id, ctx.actor.id, ItemStatus.pending_review
+    )
 
 
 @router.post("/items/{item_id}/archive", response_model=CatalogItemWithRelations)

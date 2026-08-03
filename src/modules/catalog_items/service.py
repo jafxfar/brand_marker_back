@@ -1,10 +1,15 @@
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.core.exceptions import ForbiddenError, NotFoundError
+from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from src.models import (
+    Actor,
+    ActorKind,
     CatalogItem,
+    CatalogItemReport,
+    CatalogItemReportReason,
+    CatalogItemReportStatus,
     CatalogItemType,
     Category,
     ItemAttribute,
@@ -14,19 +19,34 @@ from src.models import (
     ItemStats,
     ItemStatus,
     PricingType,
+    User,
 )
 from src.modules.catalog_items.schemas import (
     CatalogItemInput,
+    CatalogItemReportCreate,
+    CatalogItemReportResponse,
     CatalogItemWithRelations,
     CategoryRefSchema,
     ItemStatsSchema,
 )
 
+SUPPLIER_WRITABLE_STATUSES = {
+    ItemStatus.draft,
+    ItemStatus.pending_review,
+    ItemStatus.changes_requested,
+    ItemStatus.archived,
+}
+SUPPLIER_EDITABLE_STATUSES = {
+    ItemStatus.draft,
+    ItemStatus.changes_requested,
+    ItemStatus.pending_review,
+    ItemStatus.active,
+    ItemStatus.hidden,
+    ItemStatus.archived,
+}
+
 
 def _item_to_schema(item: CatalogItem) -> CatalogItemWithRelations:
-    category = None
-    if item.category_id:
-        pass
     return CatalogItemWithRelations(
         id=item.id,
         actor_id=item.actor_id,
@@ -107,16 +127,43 @@ class CatalogItemService:
             .options(*self._load_options)
         )
         item = result.scalar_one_or_none()
-        if not item:
+        if not item or item.status == ItemStatus.deleted:
             raise NotFoundError("Catalog item not found")
         return item
+
+    @staticmethod
+    def _normalize_supplier_status(
+        requested: str,
+        *,
+        current: ItemStatus | None = None,
+    ) -> ItemStatus:
+        try:
+            status = ItemStatus(requested)
+        except ValueError as exc:
+            raise ValidationError("Unsupported catalog item status") from exc
+
+        if status in {ItemStatus.active, ItemStatus.hidden, ItemStatus.deleted}:
+            raise ForbiddenError("Supplier cannot set this status")
+
+        if status == ItemStatus.pending_review:
+            return ItemStatus.pending_review
+
+        if current == ItemStatus.changes_requested and status == ItemStatus.draft:
+            return ItemStatus.draft
+
+        if status not in SUPPLIER_WRITABLE_STATUSES:
+            raise ForbiddenError("Supplier cannot set this status")
+        return status
 
     async def list_for_supplier(
         self, actor_id: int, status: str | None = None
     ) -> list[CatalogItemWithRelations]:
         stmt = (
             select(CatalogItem)
-            .where(CatalogItem.actor_id == actor_id)
+            .where(
+                CatalogItem.actor_id == actor_id,
+                CatalogItem.status != ItemStatus.deleted,
+            )
             .options(*self._load_options)
             .order_by(CatalogItem.created_at.desc())
         )
@@ -169,51 +216,19 @@ class CatalogItemService:
         return _item_to_schema(item)
 
     async def create(self, actor_id: int, data: CatalogItemInput) -> CatalogItemWithRelations:
+        status = self._normalize_supplier_status(data.status)
         item = CatalogItem(
             actor_id=actor_id,
             type=CatalogItemType(data.type),
             category_id=data.category_id,
             title=data.title,
             description=data.description or None,
-            status=ItemStatus(data.status),
+            status=status,
         )
         self.db.add(item)
         await self.db.flush()
-
-        for idx, attr in enumerate(data.attributes):
-            self.db.add(
-                ItemAttribute(
-                    item_id=item.id,
-                    name=attr.name,
-                    value=attr.value,
-                    value_type=attr.value_type,
-                    sort_order=attr.sort_order or idx,
-                )
-            )
-
-        self.db.add(
-            ItemPricing(
-                item_id=item.id,
-                pricing_type=PricingType(data.pricing.pricing_type),
-                currency=data.pricing.currency,
-                fixed_price=data.pricing.fixed_price,
-                hourly_rate=data.pricing.hourly_rate,
-                monthly_rate=data.pricing.monthly_rate,
-                tiers=[t.model_dump() for t in data.pricing.tiers],
-            )
-        )
-
-        for idx, m in enumerate(data.media):
-            self.db.add(
-                ItemMedia(
-                    item_id=item.id,
-                    file_name=m.file_name,
-                    file_url=m.file_url,
-                    media_type=ItemMediaType(m.media_type),
-                    sort_order=m.sort_order or idx,
-                )
-            )
-
+        await self._replace_relations(item, data)
+        await self.db.flush()
         self.db.add(ItemStats(item_id=item.id, views=0, leads=0))
         await self.db.flush()
         return await self.get(item.id, actor_id)
@@ -224,13 +239,35 @@ class CatalogItemService:
         item = await self._get_item(item_id)
         if item.actor_id != actor_id:
             raise ForbiddenError("Access denied")
+        if item.status not in SUPPLIER_EDITABLE_STATUSES:
+            raise ForbiddenError("Catalog item cannot be edited in current status")
+
+        requested = self._normalize_supplier_status(data.status, current=item.status)
+        if item.status == ItemStatus.changes_requested and requested == ItemStatus.draft:
+            next_status = ItemStatus.draft
+        elif requested == ItemStatus.pending_review:
+            next_status = ItemStatus.pending_review
+        elif item.status in {
+            ItemStatus.active,
+            ItemStatus.hidden,
+            ItemStatus.pending_review,
+        } and requested == ItemStatus.draft:
+            next_status = ItemStatus.draft
+        elif requested == ItemStatus.archived:
+            next_status = ItemStatus.archived
+        else:
+            next_status = requested if requested in SUPPLIER_WRITABLE_STATUSES else ItemStatus.draft
 
         item.type = CatalogItemType(data.type)
         item.category_id = data.category_id
         item.title = data.title
         item.description = data.description or None
-        item.status = ItemStatus(data.status)
+        item.status = next_status
+        await self._replace_relations(item, data)
+        await self.db.flush()
+        return await self.get(item.id, actor_id)
 
+    async def _replace_relations(self, item: CatalogItem, data: CatalogItemInput) -> None:
         for attr in list(item.attributes):
             await self.db.delete(attr)
         for idx, attr in enumerate(data.attributes):
@@ -258,21 +295,18 @@ class CatalogItemService:
             )
         )
 
-        for m in list(item.media):
-            await self.db.delete(m)
-        for idx, m in enumerate(data.media):
+        for media in list(item.media):
+            await self.db.delete(media)
+        for idx, media in enumerate(data.media):
             self.db.add(
                 ItemMedia(
                     item_id=item.id,
-                    file_name=m.file_name,
-                    file_url=m.file_url,
-                    media_type=ItemMediaType(m.media_type),
-                    sort_order=m.sort_order or idx,
+                    file_name=media.file_name,
+                    file_url=media.file_url,
+                    media_type=ItemMediaType(media.media_type),
+                    sort_order=media.sort_order or idx,
                 )
             )
-
-        await self.db.flush()
-        return await self.get(item.id, actor_id)
 
     async def set_status(
         self, item_id: int, actor_id: int, status: ItemStatus
@@ -280,7 +314,14 @@ class CatalogItemService:
         item = await self._get_item(item_id)
         if item.actor_id != actor_id:
             raise ForbiddenError("Access denied")
-        item.status = status
+        if status == ItemStatus.active:
+            item.status = ItemStatus.pending_review
+        elif status == ItemStatus.archived:
+            item.status = ItemStatus.archived
+        elif status == ItemStatus.draft:
+            item.status = ItemStatus.draft
+        else:
+            raise ForbiddenError("Supplier cannot set this status")
         await self.db.flush()
         return await self.get(item.id, actor_id)
 
@@ -288,4 +329,58 @@ class CatalogItemService:
         item = await self._get_item(item_id)
         if item.actor_id != actor_id:
             raise ForbiddenError("Access denied")
-        await self.db.delete(item)
+        item.status = ItemStatus.deleted
+        await self.db.flush()
+
+    async def create_report(
+        self,
+        item_id: int,
+        reporter: User,
+        data: CatalogItemReportCreate,
+    ) -> CatalogItemReportResponse:
+        item = await self._get_item(item_id)
+        if item.status != ItemStatus.active:
+            raise ValidationError("Only active catalog items can be reported")
+
+        actor_result = await self.db.execute(select(Actor).where(Actor.id == item.actor_id))
+        actor = actor_result.scalar_one_or_none()
+        if actor:
+            if actor.kind == ActorKind.individual and actor.user_id == reporter.id:
+                raise ForbiddenError("Cannot report your own catalog item")
+            if actor.kind == ActorKind.company and actor.company_id:
+                from src.models import Company
+
+                company_result = await self.db.execute(
+                    select(Company).where(Company.id == actor.company_id)
+                )
+                company = company_result.scalar_one_or_none()
+                if company and company.owner_id == reporter.id:
+                    raise ForbiddenError("Cannot report your own catalog item")
+
+        existing = await self.db.execute(
+            select(CatalogItemReport).where(
+                CatalogItemReport.item_id == item_id,
+                CatalogItemReport.reporter_user_id == reporter.id,
+                CatalogItemReport.status == CatalogItemReportStatus.open,
+            )
+        )
+        if existing.scalar_one_or_none():
+            raise ConflictError("You already have an open report for this item")
+
+        report = CatalogItemReport(
+            item_id=item_id,
+            reporter_user_id=reporter.id,
+            reason=CatalogItemReportReason(data.reason),
+            details=data.details.strip() if data.details else None,
+            status=CatalogItemReportStatus.open,
+        )
+        self.db.add(report)
+        await self.db.flush()
+        return CatalogItemReportResponse(
+            id=report.id,
+            item_id=report.item_id,
+            reason=report.reason.value,
+            details=report.details,
+            status=report.status.value,
+            created_at=report.created_at,
+        )

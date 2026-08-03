@@ -14,7 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import uuid
 
@@ -67,6 +67,13 @@ class VerificationStatus(str, enum.Enum):
     pending = "pending"
     verified = "verified"
     rejected = "rejected"
+    needs_documents = "needs_documents"
+
+
+class CompanyOperationalStatus(str, enum.Enum):
+    active = "active"
+    blocked = "blocked"
+    deactivated = "deactivated"
 
 
 class User(Base):
@@ -158,6 +165,11 @@ class Company(Base):
     address: Mapped[str | None] = mapped_column(String(500), nullable=True)
     verification_status: Mapped[VerificationStatus] = mapped_column(
         Enum(VerificationStatus, name="verification_status"), default=VerificationStatus.pending
+    )
+    operational_status: Mapped[CompanyOperationalStatus] = mapped_column(
+        Enum(CompanyOperationalStatus, name="company_operational_status"),
+        default=CompanyOperationalStatus.active,
+        index=True,
     )
     rating: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -280,6 +292,21 @@ class RfqStatus(str, enum.Enum):
     cancelled = "cancelled"
     expired = "expired"
     disputed = "disputed"
+    archived = "archived"
+
+
+class RfqReportReason(str, enum.Enum):
+    misleading = "misleading"
+    prohibited = "prohibited"
+    spam = "spam"
+    copyright = "copyright"
+    other = "other"
+
+
+class RfqReportStatus(str, enum.Enum):
+    open = "open"
+    resolved = "resolved"
+    dismissed = "dismissed"
 
 
 class Rfq(Base):
@@ -322,6 +349,40 @@ class Rfq(Base):
     invited_suppliers: Mapped[list["RfqInvitedSupplier"]] = relationship(back_populates="rfq")
     proposals: Mapped[list["Proposal"]] = relationship(back_populates="rfq")
     contracts: Mapped[list["Contract"]] = relationship(back_populates="rfq")
+    reports: Mapped[list["RfqReport"]] = relationship(back_populates="rfq")
+
+
+class RfqReport(Base):
+    __tablename__ = "rfq_reports"
+    __table_args__ = (
+        Index(
+            "uq_rfq_open_report",
+            "rfq_id",
+            "reporter_user_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rfq_id: Mapped[str] = mapped_column(ForeignKey("rfqs.id"), index=True)
+    reporter_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    reason: Mapped[RfqReportReason] = mapped_column(
+        Enum(RfqReportReason, name="rfq_report_reason")
+    )
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[RfqReportStatus] = mapped_column(
+        Enum(RfqReportStatus, name="rfq_report_status"),
+        default=RfqReportStatus.open,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    rfq: Mapped["Rfq"] = relationship(back_populates="reports")
+    reporter: Mapped["User"] = relationship(foreign_keys=[reporter_user_id])
+    resolved_by: Mapped["User | None"] = relationship(foreign_keys=[resolved_by_id])
 
 
 class RfqAttachment(Base):
@@ -366,6 +427,20 @@ class ProposalStatus(str, enum.Enum):
     withdrawn = "withdrawn"
 
 
+class ProposalReportReason(str, enum.Enum):
+    misleading = "misleading"
+    prohibited = "prohibited"
+    spam = "spam"
+    copyright = "copyright"
+    other = "other"
+
+
+class ProposalReportStatus(str, enum.Enum):
+    open = "open"
+    resolved = "resolved"
+    dismissed = "dismissed"
+
+
 class Proposal(Base):
     __tablename__ = "proposals"
 
@@ -386,6 +461,40 @@ class Proposal(Base):
         back_populates="proposal", uselist=False
     )
     contract: Mapped["Contract | None"] = relationship(back_populates="proposal", uselist=False)
+    reports: Mapped[list["ProposalReport"]] = relationship(back_populates="proposal")
+
+
+class ProposalReport(Base):
+    __tablename__ = "proposal_reports"
+    __table_args__ = (
+        Index(
+            "uq_proposal_open_report",
+            "proposal_id",
+            "reporter_user_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    proposal_id: Mapped[int] = mapped_column(ForeignKey("proposals.id"), index=True)
+    reporter_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    reason: Mapped[ProposalReportReason] = mapped_column(
+        Enum(ProposalReportReason, name="proposal_report_reason")
+    )
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[ProposalReportStatus] = mapped_column(
+        Enum(ProposalReportStatus, name="proposal_report_status"),
+        default=ProposalReportStatus.open,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    proposal: Mapped["Proposal"] = relationship(back_populates="reports")
+    reporter: Mapped["User"] = relationship(foreign_keys=[reporter_user_id])
+    resolved_by: Mapped["User | None"] = relationship(foreign_keys=[resolved_by_id])
 
 
 class ProposalAttachment(Base):
@@ -640,8 +749,26 @@ class CatalogItemType(str, enum.Enum):
 
 class ItemStatus(str, enum.Enum):
     draft = "draft"
+    pending_review = "pending_review"
+    changes_requested = "changes_requested"
     active = "active"
+    hidden = "hidden"
     archived = "archived"
+    deleted = "deleted"
+
+
+class CatalogItemReportReason(str, enum.Enum):
+    misleading = "misleading"
+    prohibited = "prohibited"
+    spam = "spam"
+    copyright = "copyright"
+    other = "other"
+
+
+class CatalogItemReportStatus(str, enum.Enum):
+    open = "open"
+    resolved = "resolved"
+    dismissed = "dismissed"
 
 
 class PricingType(str, enum.Enum):
@@ -676,6 +803,40 @@ class CatalogItem(Base):
     pricing: Mapped["ItemPricing | None"] = relationship(back_populates="item", uselist=False, cascade="all, delete-orphan")
     media: Mapped[list["ItemMedia"]] = relationship(back_populates="item", cascade="all, delete-orphan")
     stats: Mapped["ItemStats | None"] = relationship(back_populates="item", uselist=False, cascade="all, delete-orphan")
+    reports: Mapped[list["CatalogItemReport"]] = relationship(back_populates="item")
+
+
+class CatalogItemReport(Base):
+    __tablename__ = "catalog_item_reports"
+    __table_args__ = (
+        Index(
+            "uq_catalog_item_open_report",
+            "item_id",
+            "reporter_user_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("catalog_items.id"), index=True)
+    reporter_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    reason: Mapped[CatalogItemReportReason] = mapped_column(
+        Enum(CatalogItemReportReason, name="catalog_item_report_reason")
+    )
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[CatalogItemReportStatus] = mapped_column(
+        Enum(CatalogItemReportStatus, name="catalog_item_report_status"),
+        default=CatalogItemReportStatus.open,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    item: Mapped["CatalogItem"] = relationship(back_populates="reports")
+    reporter: Mapped["User"] = relationship(foreign_keys=[reporter_user_id])
+    resolved_by: Mapped["User | None"] = relationship(foreign_keys=[resolved_by_id])
 
 
 class ItemAttribute(Base):

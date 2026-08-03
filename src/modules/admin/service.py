@@ -4,15 +4,34 @@ from sqlalchemy import String, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.core.exceptions import ForbiddenError, NotFoundError
+from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
 from src.models import (
+    Actor,
+    ActorKind,
+    AuditLog,
     CatalogItem,
+    CatalogItemReport,
+    CatalogItemReportStatus,
+    CatalogItemType,
     Company,
+    CompanyOperationalStatus,
+    CompanyUser,
     Contract,
     ContractStatus,
+    Conversation,
+    ItemStatus,
+    Notification,
+    NotificationType,
     PaymentMilestone,
     PaymentMilestoneStatus,
+    Proposal,
+    ProposalReport,
+    ProposalReportStatus,
+    ProposalStatus,
+    Review,
     Rfq,
+    RfqReport,
+    RfqReportStatus,
     RfqStatus,
     SupplierInvoice,
     InvoiceStatus,
@@ -22,6 +41,7 @@ from src.models import (
     VerificationStatus,
 )
 from src.modules.auth.schemas import UserPublic
+from src.utils.audit import log_audit
 
 
 class AdminService:
@@ -90,6 +110,826 @@ class AdminService:
             },
         }
 
+    async def list_companies(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        status: str = "all",
+        query: str | None = None,
+    ) -> dict:
+        search_filters = []
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            search_pattern = f"%{normalized_query}%"
+            search_conditions = [
+                Company.title.ilike(search_pattern),
+                Company.legal_name.ilike(search_pattern),
+                Company.tax_number.ilike(search_pattern),
+                User.email.ilike(search_pattern),
+                User.first_name.ilike(search_pattern),
+                User.last_name.ilike(search_pattern),
+                cast(Company.id, String).ilike(search_pattern),
+            ]
+            if normalized_query.isdigit():
+                search_conditions.append(Company.id == int(normalized_query))
+            search_filters.append(or_(*search_conditions))
+
+        status_filter = self._company_status_filter(status)
+        filters = [*search_filters]
+        if status_filter is not None:
+            filters.append(status_filter)
+
+        base_query = select(Company).join(User, Company.owner_id == User.id)
+        total_result = await self.db.execute(
+            select(func.count())
+            .select_from(Company)
+            .join(User, Company.owner_id == User.id)
+            .where(*filters)
+        )
+        total = int(total_result.scalar_one())
+
+        count_values: dict[str, int] = {}
+        for count_status in ("all", "verified", "pending", "rejected", "blocked"):
+            count_filter = self._company_status_filter(count_status)
+            count_filters = [*search_filters]
+            if count_filter is not None:
+                count_filters.append(count_filter)
+            count_result = await self.db.execute(
+                select(func.count())
+                .select_from(Company)
+                .join(User, Company.owner_id == User.id)
+                .where(*count_filters)
+            )
+            count_values[count_status] = int(count_result.scalar_one())
+
+        companies_result = await self.db.execute(
+            base_query.where(*filters)
+            .options(selectinload(Company.owner), selectinload(Company.actors))
+            .order_by(Company.created_at.desc(), Company.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        companies = companies_result.scalars().unique().all()
+
+        return {
+            "items": [self._serialize_company_list_item(company) for company in companies],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total + page_size - 1) // page_size),
+            "status_counts": count_values,
+        }
+
+    async def get_company_detail(self, company_id: int) -> dict:
+        result = await self.db.execute(
+            select(Company)
+            .where(Company.id == company_id)
+            .options(
+                selectinload(Company.owner),
+                selectinload(Company.profile),
+                selectinload(Company.stats),
+                selectinload(Company.certificates),
+                selectinload(Company.actors),
+                selectinload(Company.members).selectinload(CompanyUser.user),
+            )
+        )
+        company = result.scalar_one_or_none()
+        if not company:
+            raise NotFoundError("Company not found")
+
+        actor_ids = [actor.id for actor in company.actors]
+        catalog_items = []
+        contracts = []
+        reviews = []
+        if actor_ids:
+            catalog_result = await self.db.execute(
+                select(CatalogItem)
+                .where(
+                    CatalogItem.actor_id.in_(actor_ids),
+                    CatalogItem.status != ItemStatus.deleted,
+                )
+                .options(
+                    selectinload(CatalogItem.category),
+                    selectinload(CatalogItem.pricing),
+                    selectinload(CatalogItem.stats),
+                    selectinload(CatalogItem.media),
+                )
+                .order_by(CatalogItem.created_at.desc())
+            )
+            catalog_items = catalog_result.scalars().unique().all()
+
+            contracts_result = await self.db.execute(
+                select(Contract)
+                .where(
+                    or_(
+                        Contract.buyer_actor_id.in_(actor_ids),
+                        Contract.supplier_actor_id.in_(actor_ids),
+                    )
+                )
+                .order_by(Contract.created_at.desc())
+                .limit(50)
+            )
+            contracts = contracts_result.scalars().all()
+
+            reviews_result = await self.db.execute(
+                select(Review)
+                .where(Review.target_actor_id.in_(actor_ids))
+                .order_by(Review.created_at.desc())
+                .limit(50)
+            )
+            reviews = reviews_result.scalars().all()
+
+        return {
+            **self._serialize_company_list_item(company),
+            "legal_name": company.legal_name,
+            "tax_number": company.tax_number,
+            "website": company.website,
+            "description": company.description,
+            "address": company.address,
+            "updated_at": company.updated_at,
+            "profile": (
+                {
+                    "founded_year": company.profile.founded_year,
+                    "employees_count": company.profile.employees_count,
+                    "annual_revenue_range": company.profile.annual_revenue_range,
+                    "languages": company.profile.languages,
+                    "industries": company.profile.industries,
+                }
+                if company.profile
+                else None
+            ),
+            "stats": (
+                {
+                    "completed_contracts": company.stats.completed_contracts,
+                    "active_contracts": company.stats.active_contracts,
+                    "disputes_count": company.stats.disputes_count,
+                    "average_rating": company.stats.average_rating,
+                }
+                if company.stats
+                else None
+            ),
+            "members": [
+                {
+                    "id": membership.id,
+                    "user_id": membership.user_id,
+                    "role": membership.role.value,
+                    "email": membership.user.email,
+                    "name": (
+                        f"{membership.user.first_name} {membership.user.last_name}".strip()
+                    ),
+                    "status": membership.user.status.value,
+                }
+                for membership in company.members
+            ],
+            "certificates": [
+                {
+                    "id": certificate.id,
+                    "title": certificate.title,
+                    "issuer": certificate.issuer,
+                    "issue_date": certificate.issue_date,
+                    "expiry_date": certificate.expiry_date,
+                    "file_url": certificate.file_url,
+                }
+                for certificate in company.certificates
+            ],
+            "products": [
+                self._serialize_catalog_item(item)
+                for item in catalog_items
+                if item.type == CatalogItemType.product
+            ],
+            "services": [
+                self._serialize_catalog_item(item)
+                for item in catalog_items
+                if item.type == CatalogItemType.service
+            ],
+            "contracts": [
+                {
+                    "id": contract.id,
+                    "title": contract.title,
+                    "status": contract.status.value,
+                    "agreed_amount": contract.agreed_amount,
+                    "currency": contract.currency.value,
+                    "buyer_actor_id": contract.buyer_actor_id,
+                    "supplier_actor_id": contract.supplier_actor_id,
+                    "created_at": contract.created_at,
+                }
+                for contract in contracts
+            ],
+            "reviews": [
+                {
+                    "id": review.id,
+                    "contract_id": review.contract_id,
+                    "reviewer_actor_id": review.reviewer_actor_id,
+                    "rating": review.rating,
+                    "comment": review.comment,
+                    "created_at": review.created_at,
+                }
+                for review in reviews
+            ],
+            "verification_checklist": {
+                "legal_name": bool(company.legal_name),
+                "tax_number": bool(company.tax_number),
+                "address": bool(company.address),
+                "website": bool(company.website),
+                "certificates": bool(company.certificates),
+            },
+        }
+
+    async def apply_company_action(
+        self,
+        company_id: int,
+        action: str,
+        current_user: User,
+        reason: str | None = None,
+    ) -> dict:
+        result = await self.db.execute(
+            select(Company)
+            .where(Company.id == company_id)
+            .options(selectinload(Company.actors))
+        )
+        company = result.scalar_one_or_none()
+        if not company:
+            raise NotFoundError("Company not found")
+
+        verification_actions = {"approve", "reject", "request_documents"}
+        operational_actions = {"block", "deactivate", "reactivate"}
+        if action not in verification_actions | operational_actions:
+            raise ValidationError("Unsupported company action")
+        if action in operational_actions and current_user.role == UserRole.moderator:
+            raise ForbiddenError("Moderator cannot change company operational status")
+        if action in {"reject", "request_documents", "block", "deactivate"} and not (
+            reason and reason.strip()
+        ):
+            raise ValidationError("Reason is required for this action")
+
+        previous_verification = company.verification_status.value
+        previous_operational = company.operational_status.value
+
+        if action == "approve":
+            company.verification_status = VerificationStatus.verified
+        elif action == "reject":
+            company.verification_status = VerificationStatus.rejected
+        elif action == "request_documents":
+            company.verification_status = VerificationStatus.needs_documents
+        elif action == "block":
+            company.operational_status = CompanyOperationalStatus.blocked
+            for actor in company.actors:
+                actor.is_active = False
+        elif action == "deactivate":
+            company.operational_status = CompanyOperationalStatus.deactivated
+            for actor in company.actors:
+                actor.is_active = False
+        elif action == "reactivate":
+            company.operational_status = CompanyOperationalStatus.active
+            for actor in company.actors:
+                actor.is_active = True
+
+        notification_title, notification_body = self._company_action_notification(
+            action,
+            company.title,
+            reason,
+        )
+        self.db.add(
+            Notification(
+                user_id=company.owner_id,
+                company_id=company.id,
+                type=NotificationType.system,
+                title=notification_title,
+                body=notification_body,
+                href=f"/{'supplier' if company.actor_type.value == 'supplier' else 'customer'}/company/{company.id}",
+            )
+        )
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.company.{action}",
+            resource_type="company",
+            resource_id=str(company.id),
+            details={
+                "reason": reason.strip() if reason else None,
+                "previous_verification_status": previous_verification,
+                "verification_status": company.verification_status.value,
+                "previous_operational_status": previous_operational,
+                "operational_status": company.operational_status.value,
+            },
+        )
+        await self.db.flush()
+
+        return {
+            "id": company.id,
+            "action": action,
+            "verification_status": company.verification_status.value,
+            "operational_status": company.operational_status.value,
+        }
+
+    @staticmethod
+    def _company_status_filter(status: str):
+        if status == "verified":
+            return Company.verification_status == VerificationStatus.verified
+        if status == "pending":
+            return Company.verification_status.in_(
+                [VerificationStatus.pending, VerificationStatus.needs_documents]
+            )
+        if status == "rejected":
+            return Company.verification_status == VerificationStatus.rejected
+        if status == "blocked":
+            return Company.operational_status == CompanyOperationalStatus.blocked
+        return None
+
+    @staticmethod
+    def _serialize_company_list_item(company: Company) -> dict:
+        return {
+            "id": company.id,
+            "title": company.title,
+            "actor_type": company.actor_type.value,
+            "actor_types": sorted({actor.side.value for actor in company.actors}),
+            "owner": {
+                "id": company.owner.id,
+                "email": company.owner.email,
+                "name": f"{company.owner.first_name} {company.owner.last_name}".strip(),
+            },
+            "legal_name": company.legal_name,
+            "tax_number": company.tax_number,
+            "logo": company.logo,
+            "country": company.country,
+            "city": company.city,
+            "verification_status": company.verification_status.value,
+            "operational_status": company.operational_status.value,
+            "rating": company.rating,
+            "created_at": company.created_at,
+        }
+
+    @staticmethod
+    def _serialize_catalog_item(item: CatalogItem) -> dict:
+        price = None
+        currency = None
+        if item.pricing:
+            price = (
+                item.pricing.fixed_price
+                or item.pricing.hourly_rate
+                or item.pricing.monthly_rate
+            )
+            currency = item.pricing.currency
+        return {
+            "id": item.id,
+            "title": item.title,
+            "status": item.status.value,
+            "category": item.category.name if item.category else None,
+            "price": price,
+            "currency": currency,
+            "views": item.stats.views if item.stats else 0,
+            "leads": item.stats.leads if item.stats else 0,
+            "created_at": item.created_at,
+        }
+
+    @staticmethod
+    def _company_action_notification(
+        action: str,
+        company_title: str,
+        reason: str | None,
+    ) -> tuple[str, str]:
+        messages = {
+            "approve": (
+                "Компания верифицирована",
+                f"Компания «{company_title}» прошла проверку.",
+            ),
+            "reject": (
+                "Верификация отклонена",
+                f"Проверка компании «{company_title}» отклонена.",
+            ),
+            "request_documents": (
+                "Нужны дополнительные документы",
+                f"Для компании «{company_title}» запрошены дополнительные документы.",
+            ),
+            "block": (
+                "Компания заблокирована",
+                f"Компания «{company_title}» заблокирована администратором.",
+            ),
+            "deactivate": (
+                "Компания деактивирована",
+                f"Компания «{company_title}» деактивирована администратором.",
+            ),
+            "reactivate": (
+                "Компания активирована",
+                f"Доступ компании «{company_title}» восстановлен.",
+            ),
+        }
+        title, body = messages[action]
+        if reason:
+            body = f"{body} Причина: {reason.strip()}"
+        return title, body
+
+    async def list_catalog_items(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        view: str = "all",
+        query: str | None = None,
+    ) -> dict:
+        search_filters = [CatalogItem.status != ItemStatus.deleted]
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            search_pattern = f"%{normalized_query}%"
+            search_conditions = [
+                CatalogItem.title.ilike(search_pattern),
+                CatalogItem.description.ilike(search_pattern),
+                cast(CatalogItem.id, String).ilike(search_pattern),
+            ]
+            if normalized_query.isdigit():
+                search_conditions.append(CatalogItem.id == int(normalized_query))
+            search_filters.append(or_(*search_conditions))
+
+        view_filter = self._catalog_view_filter(view)
+        filters = [*search_filters]
+        if view_filter is not None:
+            filters.append(view_filter)
+
+        total_result = await self.db.execute(
+            select(func.count()).select_from(CatalogItem).where(*filters)
+        )
+        total = int(total_result.scalar_one())
+
+        count_values: dict[str, int] = {}
+        for count_view in ("all", "products", "services", "draft", "reported", "hidden"):
+            count_filter = self._catalog_view_filter(count_view)
+            count_filters = [*search_filters]
+            if count_filter is not None:
+                count_filters.append(count_filter)
+            count_result = await self.db.execute(
+                select(func.count()).select_from(CatalogItem).where(*count_filters)
+            )
+            count_values[count_view] = int(count_result.scalar_one())
+
+        items_result = await self.db.execute(
+            select(CatalogItem)
+            .where(*filters)
+            .options(
+                selectinload(CatalogItem.category),
+                selectinload(CatalogItem.pricing),
+                selectinload(CatalogItem.media),
+                selectinload(CatalogItem.stats),
+                selectinload(CatalogItem.reports),
+            )
+            .order_by(CatalogItem.created_at.desc(), CatalogItem.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = items_result.scalars().unique().all()
+        actor_ids = [item.actor_id for item in items]
+        owners = await self._load_catalog_owners(actor_ids)
+
+        return {
+            "items": [
+                self._serialize_catalog_list_item(item, owners.get(item.actor_id))
+                for item in items
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total + page_size - 1) // page_size),
+            "view_counts": count_values,
+        }
+
+    async def get_catalog_item_detail(self, item_id: int) -> dict:
+        result = await self.db.execute(
+            select(CatalogItem)
+            .where(CatalogItem.id == item_id)
+            .options(
+                selectinload(CatalogItem.category),
+                selectinload(CatalogItem.attributes),
+                selectinload(CatalogItem.pricing),
+                selectinload(CatalogItem.media),
+                selectinload(CatalogItem.stats),
+                selectinload(CatalogItem.reports).selectinload(CatalogItemReport.reporter),
+            )
+        )
+        item = result.scalar_one_or_none()
+        if not item or item.status == ItemStatus.deleted:
+            raise NotFoundError("Catalog item not found")
+
+        owners = await self._load_catalog_owners([item.actor_id])
+        owner = owners.get(item.actor_id)
+        history_result = await self.db.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.resource_type == "catalog_item",
+                AuditLog.resource_id == str(item.id),
+            )
+            .options(selectinload(AuditLog.user))
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(50)
+        )
+        history = history_result.scalars().all()
+
+        return {
+            **self._serialize_catalog_list_item(item, owner),
+            "description": item.description,
+            "updated_at": item.created_at,
+            "category": (
+                {
+                    "id": item.category.id,
+                    "name": item.category.name,
+                    "slug": item.category.slug,
+                }
+                if item.category
+                else None
+            ),
+            "attributes": [
+                {
+                    "id": attribute.id,
+                    "name": attribute.name,
+                    "value": attribute.value,
+                    "value_type": attribute.value_type,
+                    "sort_order": attribute.sort_order,
+                }
+                for attribute in sorted(item.attributes, key=lambda value: value.sort_order)
+            ],
+            "pricing": (
+                {
+                    "pricing_type": item.pricing.pricing_type.value,
+                    "currency": item.pricing.currency,
+                    "fixed_price": item.pricing.fixed_price,
+                    "hourly_rate": item.pricing.hourly_rate,
+                    "monthly_rate": item.pricing.monthly_rate,
+                    "tiers": item.pricing.tiers or [],
+                }
+                if item.pricing
+                else None
+            ),
+            "media": [
+                {
+                    "id": media.id,
+                    "file_name": media.file_name,
+                    "file_url": media.file_url,
+                    "media_type": media.media_type.value,
+                    "sort_order": media.sort_order,
+                }
+                for media in sorted(item.media, key=lambda value: value.sort_order)
+            ],
+            "stats": (
+                {
+                    "views": item.stats.views,
+                    "leads": item.stats.leads,
+                }
+                if item.stats
+                else {"views": 0, "leads": 0}
+            ),
+            "owner": owner,
+            "reports": [
+                {
+                    "id": report.id,
+                    "reason": report.reason.value,
+                    "details": report.details,
+                    "status": report.status.value,
+                    "created_at": report.created_at,
+                    "resolved_at": report.resolved_at,
+                    "reporter": {
+                        "id": report.reporter.id,
+                        "email": report.reporter.email,
+                        "name": f"{report.reporter.first_name} {report.reporter.last_name}".strip(),
+                    },
+                }
+                for report in sorted(
+                    item.reports,
+                    key=lambda value: value.created_at,
+                    reverse=True,
+                )
+            ],
+            "history": [
+                {
+                    "id": entry.id,
+                    "action": entry.action,
+                    "details": entry.details or {},
+                    "created_at": entry.created_at,
+                    "actor": (
+                        {
+                            "id": entry.user.id,
+                            "email": entry.user.email,
+                            "name": f"{entry.user.first_name} {entry.user.last_name}".strip(),
+                        }
+                        if entry.user
+                        else None
+                    ),
+                }
+                for entry in history
+            ],
+        }
+
+    async def apply_catalog_action(
+        self,
+        item_id: int,
+        action: str,
+        current_user: User,
+        reason: str | None = None,
+    ) -> dict:
+        result = await self.db.execute(
+            select(CatalogItem)
+            .where(CatalogItem.id == item_id)
+            .options(selectinload(CatalogItem.reports))
+        )
+        item = result.scalar_one_or_none()
+        if not item or item.status == ItemStatus.deleted:
+            raise NotFoundError("Catalog item not found")
+
+        allowed = {"approve", "hide", "request_changes", "delete"}
+        if action not in allowed:
+            raise ValidationError("Unsupported catalog action")
+        if action == "delete" and current_user.role == UserRole.moderator:
+            raise ForbiddenError("Moderator cannot delete catalog items")
+        if action in {"hide", "request_changes", "delete"} and not (reason and reason.strip()):
+            raise ValidationError("Reason is required for this action")
+
+        previous_status = item.status.value
+        if action == "approve":
+            item.status = ItemStatus.active
+            for report in item.reports:
+                if report.status == CatalogItemReportStatus.open:
+                    report.status = CatalogItemReportStatus.dismissed
+                    report.resolved_at = datetime.now(timezone.utc)
+                    report.resolved_by_id = current_user.id
+        elif action == "hide":
+            item.status = ItemStatus.hidden
+            for report in item.reports:
+                if report.status == CatalogItemReportStatus.open:
+                    report.status = CatalogItemReportStatus.resolved
+                    report.resolved_at = datetime.now(timezone.utc)
+                    report.resolved_by_id = current_user.id
+        elif action == "request_changes":
+            item.status = ItemStatus.changes_requested
+        elif action == "delete":
+            item.status = ItemStatus.deleted
+            for report in item.reports:
+                if report.status == CatalogItemReportStatus.open:
+                    report.status = CatalogItemReportStatus.resolved
+                    report.resolved_at = datetime.now(timezone.utc)
+                    report.resolved_by_id = current_user.id
+
+        owner_user_id = await self._resolve_catalog_owner_user_id(item.actor_id)
+        if owner_user_id:
+            title, body = self._catalog_action_notification(action, item.title, reason)
+            self.db.add(
+                Notification(
+                    user_id=owner_user_id,
+                    company_id=None,
+                    type=NotificationType.system,
+                    title=title,
+                    body=body,
+                    href=f"/supplier/catalog/{item.id}",
+                )
+            )
+
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.catalog.{action}",
+            resource_type="catalog_item",
+            resource_id=str(item.id),
+            details={
+                "reason": reason.strip() if reason else None,
+                "previous_status": previous_status,
+                "status": item.status.value,
+            },
+        )
+        await self.db.flush()
+        return {
+            "id": item.id,
+            "action": action,
+            "status": item.status.value,
+        }
+
+    @staticmethod
+    def _catalog_view_filter(view: str):
+        if view == "products":
+            return CatalogItem.type == CatalogItemType.product
+        if view == "services":
+            return CatalogItem.type == CatalogItemType.service
+        if view == "draft":
+            return CatalogItem.status.in_(
+                [
+                    ItemStatus.draft,
+                    ItemStatus.pending_review,
+                    ItemStatus.changes_requested,
+                ]
+            )
+        if view == "reported":
+            return CatalogItem.id.in_(
+                select(CatalogItemReport.item_id).where(
+                    CatalogItemReport.status == CatalogItemReportStatus.open
+                )
+            )
+        if view == "hidden":
+            return CatalogItem.status == ItemStatus.hidden
+        return None
+
+    async def _load_catalog_owners(self, actor_ids: list[int]) -> dict[int, dict]:
+        if not actor_ids:
+            return {}
+        actors_result = await self.db.execute(
+            select(Actor)
+            .where(Actor.id.in_(actor_ids))
+            .options(
+                selectinload(Actor.user),
+                selectinload(Actor.company).selectinload(Company.owner),
+            )
+        )
+        owners: dict[int, dict] = {}
+        for actor in actors_result.scalars().unique().all():
+            if actor.kind == ActorKind.company and actor.company:
+                company = actor.company
+                owner_user = company.owner
+                owners[actor.id] = {
+                    "actor_id": actor.id,
+                    "actor_kind": actor.kind.value,
+                    "display_name": actor.display_name,
+                    "company_id": company.id,
+                    "company_title": company.title,
+                    "user_id": owner_user.id if owner_user else None,
+                    "email": owner_user.email if owner_user else None,
+                    "name": (
+                        f"{owner_user.first_name} {owner_user.last_name}".strip()
+                        if owner_user
+                        else actor.display_name
+                    ),
+                }
+            else:
+                user = actor.user
+                owners[actor.id] = {
+                    "actor_id": actor.id,
+                    "actor_kind": actor.kind.value,
+                    "display_name": actor.display_name,
+                    "company_id": None,
+                    "company_title": None,
+                    "user_id": user.id if user else None,
+                    "email": user.email if user else None,
+                    "name": (
+                        f"{user.first_name} {user.last_name}".strip()
+                        if user
+                        else actor.display_name
+                    ),
+                }
+        return owners
+
+    async def _resolve_catalog_owner_user_id(self, actor_id: int) -> int | None:
+        owners = await self._load_catalog_owners([actor_id])
+        owner = owners.get(actor_id)
+        return owner.get("user_id") if owner else None
+
+    @staticmethod
+    def _serialize_catalog_list_item(item: CatalogItem, owner: dict | None) -> dict:
+        open_reports = sum(
+            1 for report in item.reports if report.status == CatalogItemReportStatus.open
+        )
+        preview = next(
+            (
+                media.file_url
+                for media in sorted(item.media, key=lambda value: value.sort_order)
+                if media.media_type.value == "image"
+            ),
+            None,
+        )
+        return {
+            "id": item.id,
+            "title": item.title,
+            "type": item.type.value,
+            "status": item.status.value,
+            "category_name": item.category.name if item.category else None,
+            "preview_url": preview,
+            "open_reports_count": open_reports,
+            "owner": owner,
+            "created_at": item.created_at,
+            "views": item.stats.views if item.stats else 0,
+            "leads": item.stats.leads if item.stats else 0,
+        }
+
+    @staticmethod
+    def _catalog_action_notification(
+        action: str,
+        item_title: str,
+        reason: str | None,
+    ) -> tuple[str, str]:
+        messages = {
+            "approve": (
+                "Позиция одобрена",
+                f"Позиция «{item_title}» опубликована в каталоге.",
+            ),
+            "hide": (
+                "Позиция скрыта",
+                f"Позиция «{item_title}» скрыта модератором.",
+            ),
+            "request_changes": (
+                "Нужны изменения",
+                f"Для позиции «{item_title}» запрошены правки перед публикацией.",
+            ),
+            "delete": (
+                "Позиция удалена",
+                f"Позиция «{item_title}» удалена администратором.",
+            ),
+        }
+        title, body = messages[action]
+        if reason:
+            body = f"{body} Причина: {reason.strip()}"
+        return title, body
+
     async def get_dashboard(self) -> dict:
         async def count(model, *filters) -> int:
             statement = select(func.count()).select_from(model)
@@ -140,7 +980,9 @@ class AdminService:
         metrics = {
             "total_users": await count(User),
             "total_companies": await count(Company),
-            "catalog_items": await count(CatalogItem),
+            "catalog_items": await count(
+                CatalogItem, CatalogItem.status != ItemStatus.deleted
+            ),
             "active_rfqs": await count(Rfq, Rfq.status.in_(active_rfq_statuses)),
             "active_contracts": await count(
                 Contract,
@@ -308,3 +1150,801 @@ class AdminService:
         contract.status = ContractStatus.completed if resolution == "buyer" else ContractStatus.cancelled
         await self.db.flush()
         return {"contract_id": contract.id, "status": contract.status.value, "resolution": resolution}
+
+    async def list_rfqs(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        view: str = "published",
+        query: str | None = None,
+    ) -> dict:
+        search_filters: list = []
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            search_pattern = f"%{normalized_query}%"
+            search_filters.append(
+                or_(
+                    Rfq.title.ilike(search_pattern),
+                    Rfq.description.ilike(search_pattern),
+                    Rfq.id.ilike(search_pattern),
+                    Rfq.category_id.ilike(search_pattern),
+                )
+            )
+
+        view_filter = self._rfq_view_filter(view)
+        filters = [*search_filters]
+        if view_filter is not None:
+            filters.append(view_filter)
+
+        count_stmt = select(func.count()).select_from(Rfq)
+        if filters:
+            count_stmt = count_stmt.where(*filters)
+        total = int((await self.db.execute(count_stmt)).scalar_one())
+
+        count_values: dict[str, int] = {}
+        for count_view in ("published", "closed", "draft", "reported", "archived"):
+            count_filter = self._rfq_view_filter(count_view)
+            count_filters = [*search_filters]
+            if count_filter is not None:
+                count_filters.append(count_filter)
+            view_count_stmt = select(func.count()).select_from(Rfq)
+            if count_filters:
+                view_count_stmt = view_count_stmt.where(*count_filters)
+            count_values[count_view] = int(
+                (await self.db.execute(view_count_stmt)).scalar_one()
+            )
+
+        items_stmt = select(Rfq).options(
+            selectinload(Rfq.reports),
+            selectinload(Rfq.proposals),
+            selectinload(Rfq.attachments),
+        )
+        if filters:
+            items_stmt = items_stmt.where(*filters)
+        items_result = await self.db.execute(
+            items_stmt.order_by(Rfq.updated_at.desc(), Rfq.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = items_result.scalars().unique().all()
+        buyers = await self._load_catalog_owners([item.actor_id for item in items])
+
+        return {
+            "items": [
+                self._serialize_rfq_list_item(item, buyers.get(item.actor_id))
+                for item in items
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total + page_size - 1) // page_size) if total else 1,
+            "view_counts": count_values,
+        }
+
+    async def get_rfq_detail(self, rfq_id: str) -> dict:
+        result = await self.db.execute(
+            select(Rfq)
+            .where(Rfq.id == rfq_id)
+            .options(
+                selectinload(Rfq.attachments),
+                selectinload(Rfq.reports).selectinload(RfqReport.reporter),
+                selectinload(Rfq.proposals).selectinload(Proposal.attachment),
+                selectinload(Rfq.contracts)
+                .selectinload(Contract.conversation)
+                .selectinload(Conversation.messages),
+            )
+        )
+        rfq = result.scalar_one_or_none()
+        if not rfq:
+            raise NotFoundError("RFQ not found")
+
+        buyers = await self._load_catalog_owners([rfq.actor_id])
+        buyer = buyers.get(rfq.actor_id)
+        suppliers = await self._load_catalog_owners(
+            [p.supplier_actor_id for p in rfq.proposals]
+        )
+
+        history_result = await self.db.execute(
+            select(AuditLog)
+            .where(AuditLog.resource_type == "rfq", AuditLog.resource_id == rfq.id)
+            .options(selectinload(AuditLog.user))
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(50)
+        )
+        history = history_result.scalars().all()
+
+        messages: list[dict] = []
+        for proposal in rfq.proposals:
+            if proposal.message:
+                supplier = suppliers.get(proposal.supplier_actor_id)
+                messages.append(
+                    {
+                        "id": f"proposal-{proposal.id}",
+                        "source": "proposal",
+                        "proposal_id": proposal.id,
+                        "contract_id": None,
+                        "sender_name": (
+                            (supplier.get("company_title") or supplier.get("name"))
+                            if supplier
+                            else f"Supplier #{proposal.supplier_actor_id}"
+                        ),
+                        "text": proposal.message,
+                        "created_at": proposal.created_at,
+                    }
+                )
+        for contract in rfq.contracts:
+            if not contract.conversation:
+                continue
+            for message in contract.conversation.messages:
+                messages.append(
+                    {
+                        "id": f"message-{message.id}",
+                        "source": "contract",
+                        "proposal_id": contract.proposal_id,
+                        "contract_id": contract.id,
+                        "sender_name": f"User #{message.sender_id}",
+                        "text": message.text,
+                        "created_at": message.created_at,
+                    }
+                )
+        messages.sort(key=lambda item: item["created_at"], reverse=True)
+
+        return {
+            **self._serialize_rfq_list_item(rfq, buyer),
+            "description": rfq.description,
+            "updated_at": rfq.updated_at,
+            "requirements": {
+                "type": rfq.type.value,
+                "category_id": rfq.category_id,
+                "budget_type": rfq.budget_type.value,
+                "budget_from": rfq.budget_from,
+                "budget_to": rfq.budget_to,
+                "currency": rfq.currency,
+                "deadline": rfq.deadline,
+                "visibility": rfq.visibility.value,
+                "quantity": rfq.quantity,
+                "delivery_country": rfq.delivery_country,
+                "delivery_city": rfq.delivery_city,
+                "delivery_address": rfq.delivery_address,
+                "delivery_date": rfq.delivery_date,
+                "project_duration": rfq.project_duration,
+                "start_date": rfq.start_date,
+                "team_size_required": rfq.team_size_required,
+                "experience_required": rfq.experience_required,
+                "attachments": [
+                    {
+                        "id": attachment.id,
+                        "file_name": attachment.file_name,
+                        "file_url": attachment.file_url,
+                        "file_type": attachment.file_type,
+                    }
+                    for attachment in rfq.attachments
+                ],
+            },
+            "buyer": buyer,
+            "proposals": [
+                {
+                    "id": proposal.id,
+                    "supplier_actor_id": proposal.supplier_actor_id,
+                    "supplier": suppliers.get(proposal.supplier_actor_id),
+                    "price": proposal.price,
+                    "currency": proposal.currency.value,
+                    "delivery_time": proposal.delivery_time,
+                    "message": proposal.message,
+                    "status": proposal.status.value,
+                    "created_at": proposal.created_at,
+                    "has_attachment": proposal.attachment is not None,
+                }
+                for proposal in sorted(
+                    rfq.proposals, key=lambda value: value.created_at, reverse=True
+                )
+            ],
+            "messages": messages,
+            "reports": [
+                {
+                    "id": report.id,
+                    "reason": report.reason.value,
+                    "details": report.details,
+                    "status": report.status.value,
+                    "created_at": report.created_at,
+                    "resolved_at": report.resolved_at,
+                    "reporter": {
+                        "id": report.reporter.id,
+                        "email": report.reporter.email,
+                        "name": f"{report.reporter.first_name} {report.reporter.last_name}".strip(),
+                    },
+                }
+                for report in sorted(
+                    rfq.reports, key=lambda value: value.created_at, reverse=True
+                )
+            ],
+            "history": [
+                {
+                    "id": entry.id,
+                    "action": entry.action,
+                    "details": entry.details or {},
+                    "created_at": entry.created_at,
+                    "actor": (
+                        {
+                            "id": entry.user.id,
+                            "email": entry.user.email,
+                            "name": f"{entry.user.first_name} {entry.user.last_name}".strip(),
+                        }
+                        if entry.user
+                        else None
+                    ),
+                }
+                for entry in history
+            ],
+        }
+
+    async def apply_rfq_action(
+        self,
+        rfq_id: str,
+        action: str,
+        current_user: User,
+        reason: str | None = None,
+    ) -> dict:
+        result = await self.db.execute(
+            select(Rfq).where(Rfq.id == rfq_id).options(selectinload(Rfq.reports))
+        )
+        rfq = result.scalar_one_or_none()
+        if not rfq:
+            raise NotFoundError("RFQ not found")
+
+        allowed = {"hide", "close", "delete", "warn_buyer"}
+        if action not in allowed:
+            raise ValidationError("Unsupported RFQ action")
+        if action == "delete" and current_user.role == UserRole.moderator:
+            raise ForbiddenError("Moderator cannot delete RFQs")
+        if action in {"hide", "close", "delete", "warn_buyer"} and not (
+            reason and reason.strip()
+        ):
+            raise ValidationError("Reason is required for this action")
+
+        previous_status = rfq.status.value
+        terminal = {
+            RfqStatus.completed,
+            RfqStatus.cancelled,
+            RfqStatus.expired,
+            RfqStatus.archived,
+        }
+
+        if action == "hide":
+            rfq.status = RfqStatus.archived
+            self._resolve_open_rfq_reports(rfq, current_user.id, RfqReportStatus.resolved)
+        elif action == "close":
+            if rfq.status in terminal:
+                raise ConflictError("RFQ is already closed")
+            rfq.status = RfqStatus.cancelled
+        elif action == "delete":
+            if rfq.status == RfqStatus.draft:
+                attachments = (
+                    await self.db.execute(
+                        select(Rfq).where(Rfq.id == rfq_id).options(
+                            selectinload(Rfq.attachments),
+                            selectinload(Rfq.invited_suppliers),
+                            selectinload(Rfq.reports),
+                        )
+                    )
+                ).scalar_one()
+                for attachment in list(attachments.attachments):
+                    await self.db.delete(attachment)
+                for invited in list(attachments.invited_suppliers):
+                    await self.db.delete(invited)
+                for report in list(attachments.reports):
+                    await self.db.delete(report)
+                await self.db.delete(attachments)
+                await log_audit(
+                    self.db,
+                    user_id=current_user.id,
+                    action="admin.rfq.delete",
+                    resource_type="rfq",
+                    resource_id=rfq_id,
+                    details={
+                        "reason": reason.strip() if reason else None,
+                        "previous_status": previous_status,
+                        "status": "deleted",
+                    },
+                )
+                await self.db.flush()
+                return {"id": rfq_id, "action": action, "status": "deleted"}
+            rfq.status = RfqStatus.archived
+            self._resolve_open_rfq_reports(rfq, current_user.id, RfqReportStatus.resolved)
+        elif action == "warn_buyer":
+            pass
+
+        buyer_user_id = await self._resolve_catalog_owner_user_id(rfq.actor_id)
+        if buyer_user_id:
+            title, body = self._rfq_action_notification(action, rfq.title, reason)
+            self.db.add(
+                Notification(
+                    user_id=buyer_user_id,
+                    company_id=None,
+                    type=NotificationType.system,
+                    title=title,
+                    body=body,
+                    href=f"/customer/rfqs/{rfq.id}",
+                )
+            )
+
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.rfq.{action}",
+            resource_type="rfq",
+            resource_id=rfq.id,
+            details={
+                "reason": reason.strip() if reason else None,
+                "previous_status": previous_status,
+                "status": rfq.status.value,
+            },
+        )
+        await self.db.flush()
+        return {"id": rfq.id, "action": action, "status": rfq.status.value}
+
+    async def list_proposals(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        view: str = "all",
+        query: str | None = None,
+    ) -> dict:
+        search_filters: list = []
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            search_pattern = f"%{normalized_query}%"
+            search_conditions = [
+                Proposal.message.ilike(search_pattern),
+                cast(Proposal.id, String).ilike(search_pattern),
+                Proposal.rfq_id.ilike(search_pattern),
+            ]
+            if normalized_query.isdigit():
+                search_conditions.append(Proposal.id == int(normalized_query))
+            search_filters.append(or_(*search_conditions))
+
+        view_filter = self._proposal_view_filter(view)
+        filters = [*search_filters]
+        if view_filter is not None:
+            filters.append(view_filter)
+
+        count_stmt = select(func.count()).select_from(Proposal)
+        if filters:
+            count_stmt = count_stmt.where(*filters)
+        total = int((await self.db.execute(count_stmt)).scalar_one())
+
+        count_values: dict[str, int] = {}
+        for count_view in ("all", "pending", "accepted", "rejected", "reported"):
+            count_filter = self._proposal_view_filter(count_view)
+            count_filters = [*search_filters]
+            if count_filter is not None:
+                count_filters.append(count_filter)
+            view_count_stmt = select(func.count()).select_from(Proposal)
+            if count_filters:
+                view_count_stmt = view_count_stmt.where(*count_filters)
+            count_values[count_view] = int(
+                (await self.db.execute(view_count_stmt)).scalar_one()
+            )
+
+        items_stmt = select(Proposal).options(
+            selectinload(Proposal.reports),
+            selectinload(Proposal.attachment),
+            selectinload(Proposal.rfq),
+            selectinload(Proposal.contract),
+        )
+        if filters:
+            items_stmt = items_stmt.where(*filters)
+        items_result = await self.db.execute(
+            items_stmt.order_by(Proposal.created_at.desc(), Proposal.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = items_result.scalars().unique().all()
+        actor_ids = [item.supplier_actor_id for item in items] + [
+            item.rfq.actor_id for item in items if item.rfq
+        ]
+        parties = await self._load_catalog_owners(actor_ids)
+
+        return {
+            "items": [
+                self._serialize_proposal_list_item(
+                    item,
+                    parties.get(item.supplier_actor_id),
+                    parties.get(item.rfq.actor_id) if item.rfq else None,
+                )
+                for item in items
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total + page_size - 1) // page_size) if total else 1,
+            "view_counts": count_values,
+        }
+
+    async def get_proposal_detail(self, proposal_id: int) -> dict:
+        result = await self.db.execute(
+            select(Proposal)
+            .where(Proposal.id == proposal_id)
+            .options(
+                selectinload(Proposal.attachment),
+                selectinload(Proposal.reports).selectinload(ProposalReport.reporter),
+                selectinload(Proposal.rfq),
+                selectinload(Proposal.contract)
+                .selectinload(Contract.conversation)
+                .selectinload(Conversation.messages),
+            )
+        )
+        proposal = result.scalar_one_or_none()
+        if not proposal:
+            raise NotFoundError("Proposal not found")
+
+        actor_ids = [proposal.supplier_actor_id]
+        if proposal.rfq:
+            actor_ids.append(proposal.rfq.actor_id)
+        parties = await self._load_catalog_owners(actor_ids)
+        supplier = parties.get(proposal.supplier_actor_id)
+        buyer = parties.get(proposal.rfq.actor_id) if proposal.rfq else None
+
+        history_result = await self.db.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.resource_type == "proposal",
+                AuditLog.resource_id == str(proposal.id),
+            )
+            .options(selectinload(AuditLog.user))
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(50)
+        )
+        history = history_result.scalars().all()
+
+        messages: list[dict] = []
+        if proposal.message:
+            messages.append(
+                {
+                    "id": f"proposal-{proposal.id}",
+                    "source": "proposal",
+                    "text": proposal.message,
+                    "sender_name": (
+                        (supplier.get("company_title") or supplier.get("name"))
+                        if supplier
+                        else f"Supplier #{proposal.supplier_actor_id}"
+                    ),
+                    "created_at": proposal.created_at,
+                }
+            )
+        if proposal.contract and proposal.contract.conversation:
+            for message in proposal.contract.conversation.messages:
+                messages.append(
+                    {
+                        "id": f"message-{message.id}",
+                        "source": "contract",
+                        "text": message.text,
+                        "sender_name": f"User #{message.sender_id}",
+                        "created_at": message.created_at,
+                    }
+                )
+        messages.sort(key=lambda item: item["created_at"], reverse=True)
+
+        contract = proposal.contract
+        return {
+            **self._serialize_proposal_list_item(proposal, supplier, buyer),
+            "delivery_time": proposal.delivery_time,
+            "message": proposal.message,
+            "attachment": (
+                {
+                    "id": proposal.attachment.id,
+                    "file_name": proposal.attachment.file_name,
+                    "file_url": proposal.attachment.file_url,
+                    "file_type": proposal.attachment.file_type,
+                }
+                if proposal.attachment
+                else None
+            ),
+            "supplier": supplier,
+            "buyer": buyer,
+            "rfq": (
+                {
+                    "id": proposal.rfq.id,
+                    "title": proposal.rfq.title,
+                    "status": proposal.rfq.status.value,
+                }
+                if proposal.rfq
+                else None
+            ),
+            "contract": (
+                {
+                    "id": contract.id,
+                    "title": contract.title,
+                    "status": contract.status.value,
+                    "agreed_amount": contract.agreed_amount,
+                    "currency": contract.currency.value,
+                    "created_at": contract.created_at,
+                }
+                if contract
+                else None
+            ),
+            "messages": messages,
+            "reports": [
+                {
+                    "id": report.id,
+                    "reason": report.reason.value,
+                    "details": report.details,
+                    "status": report.status.value,
+                    "created_at": report.created_at,
+                    "resolved_at": report.resolved_at,
+                    "reporter": {
+                        "id": report.reporter.id,
+                        "email": report.reporter.email,
+                        "name": f"{report.reporter.first_name} {report.reporter.last_name}".strip(),
+                    },
+                }
+                for report in sorted(
+                    proposal.reports, key=lambda value: value.created_at, reverse=True
+                )
+            ],
+            "history": [
+                {
+                    "id": entry.id,
+                    "action": entry.action,
+                    "details": entry.details or {},
+                    "created_at": entry.created_at,
+                    "actor": (
+                        {
+                            "id": entry.user.id,
+                            "email": entry.user.email,
+                            "name": f"{entry.user.first_name} {entry.user.last_name}".strip(),
+                        }
+                        if entry.user
+                        else None
+                    ),
+                }
+                for entry in history
+            ],
+        }
+
+    async def apply_proposal_action(
+        self,
+        proposal_id: int,
+        action: str,
+        current_user: User,
+        reason: str | None = None,
+    ) -> dict:
+        result = await self.db.execute(
+            select(Proposal)
+            .where(Proposal.id == proposal_id)
+            .options(
+                selectinload(Proposal.reports),
+                selectinload(Proposal.contract),
+                selectinload(Proposal.attachment),
+            )
+        )
+        proposal = result.scalar_one_or_none()
+        if not proposal:
+            raise NotFoundError("Proposal not found")
+
+        allowed = {"delete", "investigate", "block_supplier"}
+        if action not in allowed:
+            raise ValidationError("Unsupported proposal action")
+        if action in {"delete", "block_supplier"} and current_user.role == UserRole.moderator:
+            raise ForbiddenError("Moderator cannot perform this action")
+        if action in {"delete", "investigate", "block_supplier"} and not (
+            reason and reason.strip()
+        ):
+            raise ValidationError("Reason is required for this action")
+
+        previous_status = proposal.status.value
+        status = previous_status
+        blocked_company_id = None
+
+        if action == "delete":
+            if proposal.contract is not None:
+                raise ConflictError("Cannot delete proposal with an existing contract")
+            if proposal.attachment is not None:
+                await self.db.delete(proposal.attachment)
+            for report in list(proposal.reports):
+                await self.db.delete(report)
+            await self.db.delete(proposal)
+            await log_audit(
+                self.db,
+                user_id=current_user.id,
+                action="admin.proposal.delete",
+                resource_type="proposal",
+                resource_id=str(proposal_id),
+                details={
+                    "reason": reason.strip() if reason else None,
+                    "previous_status": previous_status,
+                    "status": "deleted",
+                },
+            )
+            await self.db.flush()
+            return {"id": proposal_id, "action": action, "status": "deleted"}
+
+        if action == "investigate":
+            self._resolve_open_proposal_reports(
+                proposal, current_user.id, ProposalReportStatus.resolved
+            )
+        elif action == "block_supplier":
+            owners = await self._load_catalog_owners([proposal.supplier_actor_id])
+            owner = owners.get(proposal.supplier_actor_id)
+            company_id = owner.get("company_id") if owner else None
+            if not company_id:
+                raise ValidationError("Supplier has no company to block")
+            blocked = await self.apply_company_action(
+                company_id=company_id,
+                action="block",
+                current_user=current_user,
+                reason=reason,
+            )
+            blocked_company_id = blocked["id"]
+
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.proposal.{action}",
+            resource_type="proposal",
+            resource_id=str(proposal.id),
+            details={
+                "reason": reason.strip() if reason else None,
+                "previous_status": previous_status,
+                "status": status,
+                "blocked_company_id": blocked_company_id,
+            },
+        )
+        await self.db.flush()
+        return {
+            "id": proposal.id,
+            "action": action,
+            "status": status,
+            "blocked_company_id": blocked_company_id,
+        }
+
+    @staticmethod
+    def _rfq_view_filter(view: str):
+        if view == "published":
+            return Rfq.status.in_(
+                [
+                    RfqStatus.published,
+                    RfqStatus.receiving_proposals,
+                    RfqStatus.supplier_selected,
+                    RfqStatus.contract_created,
+                    RfqStatus.in_progress,
+                ]
+            )
+        if view == "closed":
+            return Rfq.status.in_(
+                [
+                    RfqStatus.completed,
+                    RfqStatus.cancelled,
+                    RfqStatus.expired,
+                    RfqStatus.disputed,
+                ]
+            )
+        if view == "draft":
+            return Rfq.status == RfqStatus.draft
+        if view == "reported":
+            return Rfq.id.in_(
+                select(RfqReport.rfq_id).where(RfqReport.status == RfqReportStatus.open)
+            )
+        if view == "archived":
+            return Rfq.status == RfqStatus.archived
+        return None
+
+    @staticmethod
+    def _proposal_view_filter(view: str):
+        if view == "pending":
+            return Proposal.status.in_(
+                [
+                    ProposalStatus.submitted,
+                    ProposalStatus.viewed,
+                    ProposalStatus.shortlisted,
+                ]
+            )
+        if view == "accepted":
+            return Proposal.status == ProposalStatus.accepted
+        if view == "rejected":
+            return Proposal.status.in_(
+                [ProposalStatus.rejected, ProposalStatus.withdrawn]
+            )
+        if view == "reported":
+            return Proposal.id.in_(
+                select(ProposalReport.proposal_id).where(
+                    ProposalReport.status == ProposalReportStatus.open
+                )
+            )
+        return None
+
+    @staticmethod
+    def _serialize_rfq_list_item(rfq: Rfq, buyer: dict | None) -> dict:
+        open_reports = sum(
+            1 for report in rfq.reports if report.status == RfqReportStatus.open
+        )
+        return {
+            "id": rfq.id,
+            "title": rfq.title,
+            "type": rfq.type.value,
+            "status": rfq.status.value,
+            "category_id": rfq.category_id,
+            "currency": rfq.currency,
+            "budget_from": rfq.budget_from,
+            "budget_to": rfq.budget_to,
+            "deadline": rfq.deadline,
+            "proposals_count": len(rfq.proposals) if rfq.proposals is not None else 0,
+            "open_reports_count": open_reports,
+            "buyer": buyer,
+            "created_at": rfq.created_at,
+            "updated_at": rfq.updated_at,
+        }
+
+    @staticmethod
+    def _serialize_proposal_list_item(
+        proposal: Proposal,
+        supplier: dict | None,
+        buyer: dict | None,
+    ) -> dict:
+        open_reports = sum(
+            1
+            for report in proposal.reports
+            if report.status == ProposalReportStatus.open
+        )
+        return {
+            "id": proposal.id,
+            "rfq_id": proposal.rfq_id,
+            "rfq_title": proposal.rfq.title if proposal.rfq else None,
+            "price": proposal.price,
+            "currency": proposal.currency.value,
+            "status": proposal.status.value,
+            "open_reports_count": open_reports,
+            "has_contract": proposal.contract is not None,
+            "supplier": supplier,
+            "buyer": buyer,
+            "created_at": proposal.created_at,
+        }
+
+    @staticmethod
+    def _resolve_open_rfq_reports(
+        rfq: Rfq, resolver_id: int, status: RfqReportStatus
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        for report in rfq.reports:
+            if report.status == RfqReportStatus.open:
+                report.status = status
+                report.resolved_at = now
+                report.resolved_by_id = resolver_id
+
+    @staticmethod
+    def _resolve_open_proposal_reports(
+        proposal: Proposal, resolver_id: int, status: ProposalReportStatus
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        for report in proposal.reports:
+            if report.status == ProposalReportStatus.open:
+                report.status = status
+                report.resolved_at = now
+                report.resolved_by_id = resolver_id
+
+    @staticmethod
+    def _rfq_action_notification(
+        action: str, rfq_title: str, reason: str | None
+    ) -> tuple[str, str]:
+        messages = {
+            "hide": (
+                "Заявка скрыта",
+                f"Заявка «{rfq_title}» скрыта администратором платформы.",
+            ),
+            "close": (
+                "Заявка закрыта",
+                f"Заявка «{rfq_title}» закрыта администратором платформы.",
+            ),
+            "delete": (
+                "Заявка удалена",
+                f"Заявка «{rfq_title}» удалена администратором платформы.",
+            ),
+            "warn_buyer": (
+                "Предупреждение по заявке",
+                f"Администратор отправил предупреждение по заявке «{rfq_title}».",
+            ),
+        }
+        title, body = messages[action]
+        if reason:
+            body = f"{body} Причина: {reason.strip()}"
+        return title, body

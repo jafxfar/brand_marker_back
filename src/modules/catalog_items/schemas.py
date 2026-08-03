@@ -111,3 +111,17 @@ class CatalogItemInput(BaseModel):
     attributes: list[ItemAttributeInput] = []
     media: list[ItemMediaInput] = []
     pricing: ItemPricingInput
+
+
+class CatalogItemReportCreate(BaseModel):
+    reason: str = Field(pattern="^(misleading|prohibited|spam|copyright|other)$")
+    details: str | None = Field(default=None, max_length=2000)
+
+
+class CatalogItemReportResponse(BaseModel):
+    id: int
+    item_id: int
+    reason: str
+    details: str | None
+    status: str
+    created_at: datetime
