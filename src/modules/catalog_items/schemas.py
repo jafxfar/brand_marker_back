@@ -114,7 +114,7 @@ class CatalogItemInput(BaseModel):
 
 
 class CatalogItemReportCreate(BaseModel):
-    reason: str = Field(pattern="^(misleading|prohibited|spam|copyright|other)$")
+    reason: str = Field(pattern="^(spam|fraud|counterfeit|abuse|other)$")
     details: str | None = Field(default=None, max_length=2000)
 
 

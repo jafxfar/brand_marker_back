@@ -222,7 +222,7 @@ async def test_admin_proposals_list_detail_and_actions(
             ProposalReport(
                 proposal_id=proposal_id,
                 reporter_user_id=buyer.id,
-                reason=ProposalReportReason.misleading,
+                reason=ProposalReportReason.abuse,
                 details="Подозрительная цена",
                 status=ProposalReportStatus.open,
             )

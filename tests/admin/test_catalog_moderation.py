@@ -103,7 +103,7 @@ async def test_catalog_report_and_admin_actions(client, admin_auth, supplier_aut
 
     report_res = await client.post(
         f"/api/v1/catalog/items/{item_id}/reports",
-        json={"reason": "misleading", "details": "Цена не соответствует"},
+        json={"reason": "abuse", "details": "Цена не соответствует"},
         headers=buyer_auth["headers"],
     )
     assert report_res.status_code == 200, report_res.text

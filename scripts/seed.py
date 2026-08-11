@@ -139,8 +139,8 @@ async def seed() -> None:
                 actor_type=ActorType.buyer,
                 owner_id=buyer_user.id,
                 legal_name="ООО Демо Заказчик",
-                country="Россия",
-                city="Москва",
+                country="Таджикистан",
+                city="Душанбе",
                 verification_status=VerificationStatus.verified,
                 rating=0.0,
             )
@@ -175,8 +175,8 @@ async def seed() -> None:
                 actor_type=ActorType.supplier,
                 owner_id=supplier_user.id,
                 legal_name="ООО «ТехноСнаб»",
-                country="Россия",
-                city="Москва",
+                country="Таджикистан",
+                city="Душанбе",
                 description="Поставщик IT-оборудования",
                 verification_status=VerificationStatus.verified,
                 rating=4.7,
@@ -226,8 +226,8 @@ async def seed() -> None:
                 title="ООО Универсал Закупки",
                 actor_type=ActorType.buyer,
                 owner_id=both_user.id,
-                country="Россия",
-                city="Москва",
+                country="Таджикистан",
+                city="Душанбе",
                 verification_status=VerificationStatus.verified,
             )
             db.add(buyer_co)
@@ -241,8 +241,8 @@ async def seed() -> None:
                 title="ООО Универсал Поставки",
                 actor_type=ActorType.supplier,
                 owner_id=both_user.id,
-                country="Россия",
-                city="Москва",
+                country="Таджикистан",
+                city="Душанбе",
                 verification_status=VerificationStatus.pending,
             )
             db.add(supplier_co)

@@ -2,6 +2,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -190,6 +191,78 @@ class DisputeAdminActionResponse(BaseModel):
     status: str
     resolution: str | None = None
     contract_status: str
+
+
+class AdminFinanceParty(BaseModel):
+    actor_id: int
+    actor_kind: str
+    display_name: str
+    company_id: int | None = None
+    company_title: str | None = None
+    user_id: int | None = None
+    email: str | None = None
+    name: str
+
+
+class AdminFinanceListItem(BaseModel):
+    id: int
+    type: str
+    status: str
+    gateway: str
+    amount: float
+    commission: float
+    currency: str
+    title: str
+    invoice_id: int | None = None
+    withdrawal_id: int | None = None
+    contract_id: int | None = None
+    actor: AdminFinanceParty | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminFinanceViewCounts(BaseModel):
+    platform_revenue: int
+    subscriptions: int
+    commission: int
+    refunds: int
+    payouts: int
+
+
+class AdminFinanceListResponse(BaseModel):
+    items: list[AdminFinanceListItem]
+    total: int
+    page: int
+    page_size: int
+    pages: int
+    view_counts: AdminFinanceViewCounts
+
+
+class AdminFinanceDetail(AdminFinanceListItem):
+    description: str | None = None
+    external_id: str | None = None
+    paid_at: datetime | None = None
+    failed_at: datetime | None = None
+    refunded_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    actor: AdminFinanceParty | None = None
+    invoice: dict[str, Any] | None = None
+    withdrawal: dict[str, Any] | None = None
+    contract: dict[str, Any] | None = None
+    subscription_user_id: int | None = None
+    history: list[dict[str, Any]]
+
+
+class FinanceAdminActionRequest(BaseModel):
+    action: Literal["refund", "retry", "mark_paid"]
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class FinanceAdminActionResponse(BaseModel):
+    id: int
+    action: str
+    status: str
+    type: str
 
 
 class AdminCatalogOwner(BaseModel):
@@ -792,4 +865,199 @@ async def admin_apply_dispute_action(
         current_user=current_user,
         reason=data.reason,
         partial_buyer_amount=data.partial_buyer_amount,
+    )
+
+
+@router.get("/finance", response_model=AdminFinanceListResponse)
+async def admin_list_finance(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    view: Literal[
+        "platform_revenue",
+        "subscriptions",
+        "commission",
+        "refunds",
+        "payouts",
+    ] = "platform_revenue",
+    query: Annotated[str | None, Query(max_length=255)] = None,
+):
+    return await AdminService(db).list_finance(
+        page=page,
+        page_size=page_size,
+        view=view,
+        query=query,
+    )
+
+
+@router.get("/finance/export")
+async def admin_export_finance(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    view: Literal[
+        "platform_revenue",
+        "subscriptions",
+        "commission",
+        "refunds",
+        "payouts",
+    ] = "platform_revenue",
+    query: Annotated[str | None, Query(max_length=255)] = None,
+    payment_id: Annotated[int | None, Query(ge=1)] = None,
+):
+    csv_body = await AdminService(db).export_finance_csv(
+        view=view,
+        query=query,
+        payment_id=payment_id,
+    )
+    filename = (
+        f"finance-{payment_id}.csv" if payment_id else f"finance-{view}.csv"
+    )
+    return Response(
+        content=csv_body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/finance/{payment_id}", response_model=AdminFinanceDetail)
+async def admin_get_finance(
+    payment_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    return await AdminService(db).get_finance_detail(payment_id)
+
+
+@router.post(
+    "/finance/{payment_id}/action",
+    response_model=FinanceAdminActionResponse,
+)
+async def admin_apply_finance_action(
+    payment_id: int,
+    data: FinanceAdminActionRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(require_admin)],
+):
+    return await AdminService(db).apply_finance_action(
+        payment_id=payment_id,
+        action=data.action,
+        current_user=current_user,
+        reason=data.reason,
+    )
+
+
+class AdminReportReporter(BaseModel):
+    id: int
+    email: str
+    name: str
+
+
+class AdminReportedObject(BaseModel):
+    type: str
+    id: str
+    title: str
+    href: str
+    status: str | None = None
+    owner: dict[str, Any] | None = None
+
+
+class AdminReportListItem(BaseModel):
+    id: int
+    target_type: str
+    reason: str
+    status: str
+    details_preview: str | None = None
+    created_at: datetime
+    reporter: AdminReportReporter
+    reported_object: AdminReportedObject
+
+
+class AdminReportViewCounts(BaseModel):
+    all: int
+    spam: int
+    fraud: int
+    counterfeit: int
+    abuse: int
+    other: int
+
+
+class AdminReportListResponse(BaseModel):
+    items: list[AdminReportListItem]
+    total: int
+    page: int
+    page_size: int
+    pages: int
+    view_counts: AdminReportViewCounts
+
+
+class AdminReportDetail(BaseModel):
+    id: int
+    target_type: str
+    reason: str
+    status: str
+    details: str | None = None
+    created_at: datetime
+    resolved_at: datetime | None = None
+    reporter: AdminReportReporter
+    reported_object: AdminReportedObject
+    owner: dict[str, Any] | None = None
+    evidence: dict[str, Any]
+    history: list[dict[str, Any]]
+
+
+class ReportAdminActionRequest(BaseModel):
+    action: Literal["dismiss", "warn", "suspend", "delete"]
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class ReportAdminActionResponse(BaseModel):
+    id: int
+    target_type: str
+    action: str
+    status: str
+
+
+@router.get("/reports", response_model=AdminReportListResponse)
+async def admin_list_reports(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    view: Literal["all", "spam", "fraud", "counterfeit", "abuse", "other"] = "all",
+    query: Annotated[str | None, Query(max_length=255)] = None,
+):
+    return await AdminService(db).list_reports(
+        page=page,
+        page_size=page_size,
+        view=view,
+        query=query,
+    )
+
+
+@router.get(
+    "/reports/{target_type}/{report_id}",
+    response_model=AdminReportDetail,
+)
+async def admin_get_report(
+    target_type: Literal["catalog", "rfq", "proposal"],
+    report_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    return await AdminService(db).get_report_detail(target_type, report_id)
+
+
+@router.post(
+    "/reports/{target_type}/{report_id}/action",
+    response_model=ReportAdminActionResponse,
+)
+async def admin_apply_report_action(
+    target_type: Literal["catalog", "rfq", "proposal"],
+    report_id: int,
+    data: ReportAdminActionRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(require_admin)],
+):
+    return await AdminService(db).apply_report_action(
+        target_type=target_type,
+        report_id=report_id,
+        action=data.action,
+        current_user=current_user,
+        reason=data.reason,
     )

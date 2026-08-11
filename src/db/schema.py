@@ -138,7 +138,66 @@ async def ensure_schema() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_ensure_admin_rfq_proposal_schema_sync)
         await conn.run_sync(_ensure_admin_disputes_schema_sync)
+        await conn.run_sync(_ensure_admin_finance_schema_sync)
+        await conn.run_sync(_ensure_admin_reports_schema_sync)
     logger.info("Database schema ensured via metadata.create_all")
+
+
+def _migrate_report_reason_enum(sync_conn, type_name: str, table_name: str) -> None:
+    new_values = ("spam", "fraud", "counterfeit", "abuse", "other")
+    values_sql = ", ".join(f"'{value}'" for value in new_values)
+    new_type = f"{type_name}_new"
+    sync_conn.execute(
+        text(
+            f"""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_type WHERE typname = '{type_name}'
+                ) AND EXISTS (
+                    SELECT 1
+                    FROM pg_enum
+                    JOIN pg_type ON pg_type.oid = pg_enum.enumtypid
+                    WHERE pg_type.typname = '{type_name}'
+                      AND pg_enum.enumlabel = 'misleading'
+                ) THEN
+                    CREATE TYPE {new_type} AS ENUM ({values_sql});
+                    ALTER TABLE {table_name}
+                        ALTER COLUMN reason TYPE {new_type}
+                        USING (
+                            CASE reason::text
+                                WHEN 'spam' THEN 'spam'
+                                WHEN 'prohibited' THEN 'fraud'
+                                WHEN 'copyright' THEN 'counterfeit'
+                                WHEN 'misleading' THEN 'abuse'
+                                WHEN 'other' THEN 'other'
+                                WHEN 'fraud' THEN 'fraud'
+                                WHEN 'counterfeit' THEN 'counterfeit'
+                                WHEN 'abuse' THEN 'abuse'
+                                ELSE 'other'
+                            END::{new_type}
+                        );
+                    DROP TYPE {type_name};
+                    ALTER TYPE {new_type} RENAME TO {type_name};
+                ELSIF NOT EXISTS (
+                    SELECT 1 FROM pg_type WHERE typname = '{type_name}'
+                ) THEN
+                    CREATE TYPE {type_name} AS ENUM ({values_sql});
+                END IF;
+            END
+            $$;
+            """
+        )
+    )
+
+
+def _ensure_admin_reports_schema_sync(sync_conn) -> None:
+    for table_name, type_name in (
+        ("catalog_item_reports", "catalog_item_report_reason"),
+        ("rfq_reports", "rfq_report_reason"),
+        ("proposal_reports", "proposal_report_reason"),
+    ):
+        _migrate_report_reason_enum(sync_conn, type_name, table_name)
 
 
 def _ensure_admin_rfq_proposal_schema_sync(sync_conn) -> None:
@@ -165,11 +224,11 @@ def _ensure_admin_rfq_proposal_schema_sync(sync_conn) -> None:
     for type_name, values in (
         (
             "rfq_report_reason",
-            ("misleading", "prohibited", "spam", "copyright", "other"),
+            ("spam", "fraud", "counterfeit", "abuse", "other"),
         ),
         (
             "proposal_report_reason",
-            ("misleading", "prohibited", "spam", "copyright", "other"),
+            ("spam", "fraud", "counterfeit", "abuse", "other"),
         ),
         ("rfq_report_status", ("open", "resolved", "dismissed")),
         ("proposal_report_status", ("open", "resolved", "dismissed")),
@@ -330,6 +389,91 @@ def _ensure_admin_disputes_schema_sync(sync_conn) -> None:
             """
         )
     )
+
+
+def _ensure_admin_finance_schema_sync(sync_conn) -> None:
+    for type_name, values in (
+        (
+            "platform_payment_type",
+            (
+                "platform_revenue",
+                "subscription",
+                "commission",
+                "refund",
+                "payout",
+            ),
+        ),
+        (
+            "platform_payment_status",
+            (
+                "pending",
+                "processing",
+                "paid",
+                "failed",
+                "refunded",
+                "cancelled",
+            ),
+        ),
+        (
+            "platform_payment_gateway",
+            ("manual", "mock", "stripe", "yookassa"),
+        ),
+    ):
+        values_sql = ", ".join(f"'{value}'" for value in values)
+        sync_conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                    CREATE TYPE {type_name} AS ENUM ({values_sql});
+                EXCEPTION
+                    WHEN duplicate_object THEN NULL;
+                END
+                $$;
+                """
+            )
+        )
+
+    sync_conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS platform_payments (
+                id SERIAL PRIMARY KEY,
+                external_id VARCHAR(100),
+                type platform_payment_type NOT NULL,
+                status platform_payment_status NOT NULL DEFAULT 'pending',
+                gateway platform_payment_gateway NOT NULL DEFAULT 'manual',
+                amount DOUBLE PRECISION NOT NULL,
+                commission DOUBLE PRECISION NOT NULL DEFAULT 0,
+                currency VARCHAR(10) NOT NULL DEFAULT 'RUB',
+                title VARCHAR(255) NOT NULL,
+                description TEXT,
+                actor_id INTEGER REFERENCES actors(id),
+                invoice_id INTEGER REFERENCES supplier_invoices(id),
+                withdrawal_id INTEGER REFERENCES withdrawals(id),
+                contract_id INTEGER REFERENCES contracts(id),
+                subscription_user_id INTEGER REFERENCES users(id),
+                metadata JSONB,
+                paid_at TIMESTAMPTZ,
+                failed_at TIMESTAMPTZ,
+                refunded_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+    )
+    for index_sql in (
+        "CREATE INDEX IF NOT EXISTS ix_platform_payments_external_id ON platform_payments (external_id);",
+        "CREATE INDEX IF NOT EXISTS ix_platform_payments_actor_id ON platform_payments (actor_id);",
+        "CREATE INDEX IF NOT EXISTS ix_platform_payments_invoice_id ON platform_payments (invoice_id);",
+        "CREATE INDEX IF NOT EXISTS ix_platform_payments_withdrawal_id ON platform_payments (withdrawal_id);",
+        "CREATE INDEX IF NOT EXISTS ix_platform_payments_contract_id ON platform_payments (contract_id);",
+        "CREATE INDEX IF NOT EXISTS ix_platform_payments_subscription_user_id ON platform_payments (subscription_user_id);",
+        "CREATE INDEX IF NOT EXISTS ix_platform_payments_type ON platform_payments (type);",
+        "CREATE INDEX IF NOT EXISTS ix_platform_payments_status ON platform_payments (status);",
+    ):
+        sync_conn.execute(text(index_sql))
 
 
 async def migrate_legacy_actor_fks() -> None:

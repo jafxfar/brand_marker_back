@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError
 from src.models import (
     Actor,
+    ActorKind,
     Contract,
     ContractFile,
     ContractStatus,
@@ -27,6 +28,7 @@ from src.models import (
     WorkSubmissionType,
 )
 from src.modules.contracts.schemas import DisputeRequest, MessageCreate, WorkSubmissionCreate
+from src.modules.notifications.ws_manager import notification_ws_manager
 from src.shared.serializers import contract_to_schema
 from src.utils.audit import log_audit
 
@@ -217,6 +219,22 @@ class ContractService:
             raise ForbiddenError("Access denied")
         return contract_to_schema(contract)
 
+    async def _resolve_actor_user_ids(self, actor_id: int) -> list[int]:
+        actor = (
+            await self.db.execute(select(Actor).where(Actor.id == actor_id))
+        ).scalar_one_or_none()
+        if not actor:
+            return []
+        if actor.kind == ActorKind.individual:
+            return [actor.user_id] if actor.user_id else []
+        if actor.company_id:
+            from src.models import CompanyUser
+            members = await self.db.execute(
+                select(CompanyUser.user_id).where(CompanyUser.company_id == actor.company_id)
+            )
+            return [row[0] for row in members.all()]
+        return []
+
     async def add_message(self, contract_id: int, user_id: int, actor_id: int, data: MessageCreate):
         contract = await self._load(contract_id)
         if contract.buyer_actor_id != actor_id and contract.supplier_actor_id != actor_id:
@@ -231,6 +249,32 @@ class ContractService:
         )
         self.db.add(msg)
         await self.db.flush()
+
+        recipient_actor_id = (
+            contract.supplier_actor_id
+            if actor_id == contract.buyer_actor_id
+            else contract.buyer_actor_id
+        )
+        recipient_user_ids = await self._resolve_actor_user_ids(recipient_actor_id)
+        sender_user_ids = await self._resolve_actor_user_ids(actor_id)
+        all_user_ids = list(set(recipient_user_ids + sender_user_ids))
+        if all_user_ids:
+            await notification_ws_manager.broadcast_to_users(
+                all_user_ids,
+                {
+                    "event": "contract.message",
+                    "data": {
+                        "contract_id": contract_id,
+                        "message": {
+                            "id": msg.id,
+                            "sender_id": user_id,
+                            "text": msg.text,
+                            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+                        },
+                    },
+                },
+            )
+
         return contract_to_schema(await self._load(contract_id))
 
     async def add_file(

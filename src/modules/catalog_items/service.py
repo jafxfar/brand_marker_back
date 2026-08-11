@@ -227,6 +227,7 @@ class CatalogItemService:
         )
         self.db.add(item)
         await self.db.flush()
+        item = await self._get_item(item.id)
         await self._replace_relations(item, data)
         await self.db.flush()
         self.db.add(ItemStats(item_id=item.id, views=0, leads=0))

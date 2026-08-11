@@ -296,10 +296,10 @@ class RfqStatus(str, enum.Enum):
 
 
 class RfqReportReason(str, enum.Enum):
-    misleading = "misleading"
-    prohibited = "prohibited"
     spam = "spam"
-    copyright = "copyright"
+    fraud = "fraud"
+    counterfeit = "counterfeit"
+    abuse = "abuse"
     other = "other"
 
 
@@ -428,10 +428,10 @@ class ProposalStatus(str, enum.Enum):
 
 
 class ProposalReportReason(str, enum.Enum):
-    misleading = "misleading"
-    prohibited = "prohibited"
     spam = "spam"
-    copyright = "copyright"
+    fraud = "fraud"
+    counterfeit = "counterfeit"
+    abuse = "abuse"
     other = "other"
 
 
@@ -837,10 +837,10 @@ class ItemStatus(str, enum.Enum):
 
 
 class CatalogItemReportReason(str, enum.Enum):
-    misleading = "misleading"
-    prohibited = "prohibited"
     spam = "spam"
-    copyright = "copyright"
+    fraud = "fraud"
+    counterfeit = "counterfeit"
+    abuse = "abuse"
     other = "other"
 
 
@@ -1115,3 +1115,83 @@ class SupplierInvoice(Base):
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PlatformPaymentType(str, enum.Enum):
+    platform_revenue = "platform_revenue"
+    subscription = "subscription"
+    commission = "commission"
+    refund = "refund"
+    payout = "payout"
+
+
+class PlatformPaymentStatus(str, enum.Enum):
+    pending = "pending"
+    processing = "processing"
+    paid = "paid"
+    failed = "failed"
+    refunded = "refunded"
+    cancelled = "cancelled"
+
+
+class PlatformPaymentGateway(str, enum.Enum):
+    manual = "manual"
+    mock = "mock"
+    stripe = "stripe"
+    yookassa = "yookassa"
+
+
+class PlatformPayment(Base):
+    __tablename__ = "platform_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    external_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    type: Mapped[PlatformPaymentType] = mapped_column(
+        Enum(PlatformPaymentType, name="platform_payment_type")
+    )
+    status: Mapped[PlatformPaymentStatus] = mapped_column(
+        Enum(PlatformPaymentStatus, name="platform_payment_status"),
+        default=PlatformPaymentStatus.pending,
+    )
+    gateway: Mapped[PlatformPaymentGateway] = mapped_column(
+        Enum(PlatformPaymentGateway, name="platform_payment_gateway"),
+        default=PlatformPaymentGateway.manual,
+    )
+    amount: Mapped[float] = mapped_column(Float)
+    commission: Mapped[float] = mapped_column(Float, default=0.0)
+    currency: Mapped[str] = mapped_column(String(10), default="RUB")
+    title: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    actor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("actors.id"), nullable=True, index=True
+    )
+    invoice_id: Mapped[int | None] = mapped_column(
+        ForeignKey("supplier_invoices.id"), nullable=True, index=True
+    )
+    withdrawal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("withdrawals.id"), nullable=True, index=True
+    )
+    contract_id: Mapped[int | None] = mapped_column(
+        ForeignKey("contracts.id"), nullable=True, index=True
+    )
+    subscription_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    metadata_json: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    refunded_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    actor: Mapped["Actor | None"] = relationship(foreign_keys=[actor_id])
+    invoice: Mapped["SupplierInvoice | None"] = relationship(foreign_keys=[invoice_id])
+    withdrawal: Mapped["Withdrawal | None"] = relationship(foreign_keys=[withdrawal_id])
+    contract: Mapped["Contract | None"] = relationship(foreign_keys=[contract_id])
+    subscription_user: Mapped["User | None"] = relationship(
+        foreign_keys=[subscription_user_id]
+    )

@@ -116,6 +116,19 @@ class SupplierFinanceService:
         )
         self.db.add(withdrawal)
         await self.db.flush()
+        from src.modules.finance.ledger import FinanceLedgerService
+        from src.models import PlatformPaymentStatus, PlatformPaymentType
+
+        await FinanceLedgerService(self.db).record(
+            payment_type=PlatformPaymentType.payout,
+            amount=withdrawal.amount,
+            currency=withdrawal.currency,
+            title=f"Выплата #{withdrawal.id}",
+            description=f"Запрос вывода на destination #{withdrawal.destination_id}",
+            status=PlatformPaymentStatus.pending,
+            actor_id=actor_id,
+            withdrawal_id=withdrawal.id,
+        )
         return WithdrawalSchema(
             id=withdrawal.id,
             actor_id=withdrawal.actor_id,
@@ -171,4 +184,42 @@ class SupplierFinanceService:
         )
         self.db.add(invoice)
         await self.db.flush()
+        from src.modules.finance.ledger import FinanceLedgerService
+        from src.models import (
+            PlatformPaymentGateway,
+            PlatformPaymentStatus,
+            PlatformPaymentType,
+        )
+
+        commission = round(amount * 0.05, 2)
+        await FinanceLedgerService(self.db).record(
+            payment_type=PlatformPaymentType.platform_revenue,
+            amount=amount,
+            commission=commission,
+            currency=currency,
+            title=title,
+            description=f"Счёт {invoice.number}",
+            status=PlatformPaymentStatus.paid,
+            gateway=PlatformPaymentGateway.mock,
+            actor_id=actor_id,
+            invoice_id=invoice.id,
+            contract_id=contract_id,
+            paid_at=invoice.paid_at,
+            metadata={"milestone_id": milestone_id},
+        )
+        if commission > 0:
+            await FinanceLedgerService(self.db).record(
+                payment_type=PlatformPaymentType.commission,
+                amount=commission,
+                commission=0,
+                currency=currency,
+                title=f"Комиссия · {invoice.number}",
+                description=f"Комиссия платформы 5% по счёту {invoice.number}",
+                status=PlatformPaymentStatus.paid,
+                gateway=PlatformPaymentGateway.mock,
+                actor_id=actor_id,
+                invoice_id=invoice.id,
+                contract_id=contract_id,
+                paid_at=invoice.paid_at,
+            )
         return invoice

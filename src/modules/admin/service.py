@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import String, cast, func, literal, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -11,6 +11,7 @@ from src.models import (
     AuditLog,
     CatalogItem,
     CatalogItemReport,
+    CatalogItemReportReason,
     CatalogItemReportStatus,
     CatalogItemType,
     Company,
@@ -22,23 +23,31 @@ from src.models import (
     Dispute,
     DisputeResolution,
     DisputeStatus,
+    InvoiceStatus,
     ItemStatus,
     Notification,
     NotificationType,
     PaymentMilestone,
     PaymentMilestoneStatus,
     PaymentPlan,
+    PlatformPayment,
+    PlatformPaymentGateway,
+    PlatformPaymentStatus,
+    PlatformPaymentType,
     Proposal,
     ProposalReport,
+    ProposalReportReason,
     ProposalReportStatus,
     ProposalStatus,
     Review,
     Rfq,
     RfqReport,
+    RfqReportReason,
     RfqReportStatus,
     RfqStatus,
     SupplierInvoice,
-    InvoiceStatus,
+    Withdrawal,
+    WithdrawalStatus,
     User,
     UserRole,
     UserStatus,
@@ -1427,6 +1436,27 @@ class AdminService:
             dispute.resolved_at = now
             dispute.resolved_by_id = current_user.id
             contract.status = ContractStatus.cancelled
+            from src.modules.finance.ledger import FinanceLedgerService
+            from src.models import (
+                PlatformPaymentGateway,
+                PlatformPaymentStatus,
+                PlatformPaymentType,
+            )
+
+            refund_amount = sum(m.amount for m in milestones if m.status == PaymentMilestoneStatus.refunded)
+            if refund_amount > 0:
+                await FinanceLedgerService(self.db).record(
+                    payment_type=PlatformPaymentType.refund,
+                    amount=refund_amount,
+                    currency=contract.currency.value,
+                    title=f"Возврат · контракт #{contract.id}",
+                    description=reason.strip(),
+                    status=PlatformPaymentStatus.paid,
+                    gateway=PlatformPaymentGateway.manual,
+                    actor_id=contract.buyer_actor_id,
+                    contract_id=contract.id,
+                    metadata={"dispute_id": dispute.id, "action": "refund_buyer"},
+                )
         elif action == "partial_refund":
             if partial_buyer_amount is None or partial_buyer_amount <= 0:
                 raise ValidationError("partial_buyer_amount is required")
@@ -1441,6 +1471,28 @@ class AdminService:
             dispute.resolved_at = now
             dispute.resolved_by_id = current_user.id
             contract.status = ContractStatus.completed
+            from src.modules.finance.ledger import FinanceLedgerService
+            from src.models import (
+                PlatformPaymentGateway,
+                PlatformPaymentStatus,
+                PlatformPaymentType,
+            )
+
+            await FinanceLedgerService(self.db).record(
+                payment_type=PlatformPaymentType.refund,
+                amount=partial_buyer_amount,
+                currency=contract.currency.value,
+                title=f"Частичный возврат · контракт #{contract.id}",
+                description=reason.strip(),
+                status=PlatformPaymentStatus.paid,
+                gateway=PlatformPaymentGateway.manual,
+                actor_id=contract.buyer_actor_id,
+                contract_id=contract.id,
+                metadata={
+                    "dispute_id": dispute.id,
+                    "action": "partial_refund",
+                },
+            )
         elif action == "close_case":
             dispute.status = DisputeStatus.resolved
             dispute.resolution = DisputeResolution.close_case
@@ -2818,6 +2870,1089 @@ class AdminService:
             "open_investigation": (
                 "Открыто расследование",
                 f"По контракту «{contract_title}» открыто административное расследование.",
+            ),
+        }
+        title, body = messages[action]
+        if reason:
+            body = f"{body} Причина: {reason.strip()}"
+        return title, body
+
+    async def list_finance(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        view: str = "platform_revenue",
+        query: str | None = None,
+    ) -> dict:
+        search_filters: list = []
+        normalized_query = query.strip() if query else ""
+        if normalized_query:
+            search_pattern = f"%{normalized_query}%"
+            search_conditions = [
+                PlatformPayment.title.ilike(search_pattern),
+                PlatformPayment.description.ilike(search_pattern),
+                PlatformPayment.external_id.ilike(search_pattern),
+                cast(PlatformPayment.id, String).ilike(search_pattern),
+            ]
+            if normalized_query.isdigit():
+                search_conditions.append(PlatformPayment.id == int(normalized_query))
+            search_filters.append(or_(*search_conditions))
+
+        view_filter = self._finance_view_filter(view)
+        filters = [*search_filters]
+        if view_filter is not None:
+            filters.append(view_filter)
+
+        count_stmt = select(func.count()).select_from(PlatformPayment)
+        if filters:
+            count_stmt = count_stmt.where(*filters)
+        total = int((await self.db.execute(count_stmt)).scalar_one())
+
+        count_values: dict[str, int] = {}
+        for count_view in (
+            "platform_revenue",
+            "subscriptions",
+            "commission",
+            "refunds",
+            "payouts",
+        ):
+            count_filter = self._finance_view_filter(count_view)
+            count_filters = [*search_filters]
+            if count_filter is not None:
+                count_filters.append(count_filter)
+            view_count_stmt = select(func.count()).select_from(PlatformPayment)
+            if count_filters:
+                view_count_stmt = view_count_stmt.where(*count_filters)
+            count_values[count_view] = int(
+                (await self.db.execute(view_count_stmt)).scalar_one()
+            )
+
+        items_stmt = select(PlatformPayment).options(
+            selectinload(PlatformPayment.invoice),
+        )
+        if filters:
+            items_stmt = items_stmt.where(*filters)
+        items_result = await self.db.execute(
+            items_stmt.order_by(
+                PlatformPayment.created_at.desc(), PlatformPayment.id.desc()
+            )
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = items_result.scalars().unique().all()
+        actor_ids = [item.actor_id for item in items if item.actor_id]
+        parties = await self._load_catalog_owners(actor_ids)
+
+        return {
+            "items": [
+                self._serialize_finance_list_item(item, parties.get(item.actor_id))
+                for item in items
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total + page_size - 1) // page_size) if total else 1,
+            "view_counts": count_values,
+        }
+
+    async def get_finance_detail(self, payment_id: int) -> dict:
+        result = await self.db.execute(
+            select(PlatformPayment)
+            .where(PlatformPayment.id == payment_id)
+            .options(
+                selectinload(PlatformPayment.invoice),
+                selectinload(PlatformPayment.withdrawal),
+                selectinload(PlatformPayment.contract),
+            )
+        )
+        payment = result.scalar_one_or_none()
+        if not payment:
+            raise NotFoundError("Payment not found")
+
+        parties = await self._load_catalog_owners(
+            [payment.actor_id] if payment.actor_id else []
+        )
+        history_result = await self.db.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.resource_type == "platform_payment",
+                AuditLog.resource_id == str(payment.id),
+            )
+            .options(selectinload(AuditLog.user))
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            .limit(50)
+        )
+        history = history_result.scalars().all()
+
+        return {
+            **self._serialize_finance_list_item(
+                payment, parties.get(payment.actor_id) if payment.actor_id else None
+            ),
+            "description": payment.description,
+            "external_id": payment.external_id,
+            "paid_at": payment.paid_at,
+            "failed_at": payment.failed_at,
+            "refunded_at": payment.refunded_at,
+            "metadata": payment.metadata_json or {},
+            "actor": parties.get(payment.actor_id) if payment.actor_id else None,
+            "invoice": (
+                {
+                    "id": payment.invoice.id,
+                    "number": payment.invoice.number,
+                    "title": payment.invoice.title,
+                    "status": payment.invoice.status.value,
+                    "amount": payment.invoice.amount,
+                    "currency": payment.invoice.currency,
+                }
+                if payment.invoice
+                else None
+            ),
+            "withdrawal": (
+                {
+                    "id": payment.withdrawal.id,
+                    "amount": payment.withdrawal.amount,
+                    "status": payment.withdrawal.status.value,
+                    "currency": payment.withdrawal.currency,
+                }
+                if payment.withdrawal
+                else None
+            ),
+            "contract": (
+                {
+                    "id": payment.contract.id,
+                    "title": payment.contract.title,
+                    "status": payment.contract.status.value,
+                }
+                if payment.contract
+                else None
+            ),
+            "subscription_user_id": payment.subscription_user_id,
+            "history": [
+                {
+                    "id": entry.id,
+                    "action": entry.action,
+                    "details": entry.details or {},
+                    "created_at": entry.created_at,
+                    "actor": (
+                        {
+                            "id": entry.user.id,
+                            "email": entry.user.email,
+                            "name": f"{entry.user.first_name} {entry.user.last_name}".strip(),
+                        }
+                        if entry.user
+                        else None
+                    ),
+                }
+                for entry in history
+            ],
+        }
+
+    async def export_finance_csv(
+        self,
+        view: str = "platform_revenue",
+        query: str | None = None,
+        payment_id: int | None = None,
+    ) -> str:
+        if payment_id is not None:
+            detail = await self.get_finance_detail(payment_id)
+            rows = [detail]
+        else:
+            data = await self.list_finance(
+                page=1, page_size=5000, view=view, query=query
+            )
+            rows = data["items"]
+
+        import csv
+        import io
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                "id",
+                "type",
+                "status",
+                "gateway",
+                "amount",
+                "commission",
+                "currency",
+                "title",
+                "invoice_id",
+                "created_at",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row.get("id"),
+                    row.get("type"),
+                    row.get("status"),
+                    row.get("gateway"),
+                    row.get("amount"),
+                    row.get("commission"),
+                    row.get("currency"),
+                    row.get("title"),
+                    row.get("invoice_id"),
+                    row.get("created_at"),
+                ]
+            )
+        return buffer.getvalue()
+
+    async def apply_finance_action(
+        self,
+        payment_id: int,
+        action: str,
+        current_user: User,
+        reason: str | None = None,
+    ) -> dict:
+        result = await self.db.execute(
+            select(PlatformPayment)
+            .where(PlatformPayment.id == payment_id)
+            .options(
+                selectinload(PlatformPayment.invoice),
+                selectinload(PlatformPayment.withdrawal),
+            )
+        )
+        payment = result.scalar_one_or_none()
+        if not payment:
+            raise NotFoundError("Payment not found")
+
+        allowed = {"refund", "retry", "mark_paid"}
+        if action not in allowed:
+            raise ValidationError("Unsupported finance action")
+        if action in {"refund", "retry"} and not (reason and reason.strip()):
+            raise ValidationError("Reason is required for this action")
+
+        previous_status = payment.status.value
+        now = datetime.now(timezone.utc)
+
+        if action == "mark_paid":
+            if payment.status not in {
+                PlatformPaymentStatus.pending,
+                PlatformPaymentStatus.processing,
+            }:
+                raise ConflictError(
+                    "Only pending/processing payments can be marked paid"
+                )
+            payment.status = PlatformPaymentStatus.paid
+            payment.paid_at = now
+            if payment.invoice and payment.invoice.status != InvoiceStatus.paid:
+                payment.invoice.status = InvoiceStatus.paid
+                payment.invoice.paid_at = now
+            if payment.withdrawal and payment.withdrawal.status in {
+                WithdrawalStatus.pending,
+                WithdrawalStatus.processing,
+                WithdrawalStatus.failed,
+            }:
+                payment.withdrawal.status = WithdrawalStatus.completed
+                payment.withdrawal.completed_at = now
+        elif action == "retry":
+            if payment.status != PlatformPaymentStatus.failed:
+                raise ConflictError("Only failed payments can be retried")
+            payment.status = PlatformPaymentStatus.processing
+            payment.failed_at = None
+            await self.db.flush()
+            payment.status = PlatformPaymentStatus.paid
+            payment.paid_at = now
+            if payment.invoice:
+                payment.invoice.status = InvoiceStatus.paid
+                payment.invoice.paid_at = now
+            if payment.withdrawal:
+                payment.withdrawal.status = WithdrawalStatus.completed
+                payment.withdrawal.completed_at = now
+        elif action == "refund":
+            if payment.status != PlatformPaymentStatus.paid:
+                raise ConflictError("Only paid payments can be refunded")
+            if payment.type == PlatformPaymentType.refund:
+                raise ConflictError("Refund payments cannot be refunded")
+            payment.status = PlatformPaymentStatus.refunded
+            payment.refunded_at = now
+            if payment.invoice:
+                payment.invoice.status = InvoiceStatus.cancelled
+            if (
+                payment.withdrawal
+                and payment.withdrawal.status != WithdrawalStatus.cancelled
+            ):
+                payment.withdrawal.status = WithdrawalStatus.cancelled
+
+        if payment.actor_id:
+            user_id = await self._resolve_catalog_owner_user_id(payment.actor_id)
+            if user_id:
+                title, body = self._finance_action_notification(
+                    action, payment.title, reason
+                )
+                self.db.add(
+                    Notification(
+                        user_id=user_id,
+                        company_id=None,
+                        type=NotificationType.system,
+                        title=title,
+                        body=body,
+                        href="/supplier/finance",
+                    )
+                )
+
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.finance.{action}",
+            resource_type="platform_payment",
+            resource_id=str(payment.id),
+            details={
+                "reason": reason.strip() if reason else None,
+                "previous_status": previous_status,
+                "status": payment.status.value,
+            },
+        )
+        await self.db.flush()
+        return {
+            "id": payment.id,
+            "action": action,
+            "status": payment.status.value,
+            "type": payment.type.value,
+        }
+
+    @staticmethod
+    def _finance_view_filter(view: str):
+        mapping = {
+            "platform_revenue": PlatformPaymentType.platform_revenue,
+            "subscriptions": PlatformPaymentType.subscription,
+            "commission": PlatformPaymentType.commission,
+            "refunds": PlatformPaymentType.refund,
+            "payouts": PlatformPaymentType.payout,
+        }
+        payment_type = mapping.get(view)
+        if payment_type is None:
+            return None
+        return PlatformPayment.type == payment_type
+
+    def _serialize_finance_list_item(
+        self,
+        payment: PlatformPayment,
+        actor: dict | None,
+    ) -> dict:
+        return {
+            "id": payment.id,
+            "type": payment.type.value,
+            "status": payment.status.value,
+            "gateway": payment.gateway.value,
+            "amount": payment.amount,
+            "commission": payment.commission,
+            "currency": payment.currency,
+            "title": payment.title,
+            "invoice_id": payment.invoice_id,
+            "withdrawal_id": payment.withdrawal_id,
+            "contract_id": payment.contract_id,
+            "actor": actor,
+            "created_at": payment.created_at,
+            "updated_at": payment.updated_at,
+        }
+
+    @staticmethod
+    def _finance_action_notification(
+        action: str, payment_title: str, reason: str | None
+    ) -> tuple[str, str]:
+        messages = {
+            "mark_paid": (
+                "Платёж отмечен оплаченным",
+                f"Платёж «{payment_title}» отмечен как оплаченный.",
+            ),
+            "retry": (
+                "Повтор платежа",
+                f"Повторная обработка платежа «{payment_title}» выполнена.",
+            ),
+            "refund": (
+                "Платёж возвращён",
+                f"По платежу «{payment_title}» выполнен возврат.",
+            ),
+        }
+        title, body = messages[action]
+        if reason:
+            body = f"{body} Причина: {reason.strip()}"
+        return title, body
+
+    REPORT_REASONS = ("spam", "fraud", "counterfeit", "abuse", "other")
+    REPORT_TARGET_TYPES = ("catalog", "rfq", "proposal")
+
+    async def list_reports(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        view: str = "all",
+        query: str | None = None,
+    ) -> dict:
+        if view not in ("all", *self.REPORT_REASONS):
+            raise ValidationError("Unsupported report view")
+
+        union_stmt = self._reports_union_stmt(view=view, query=query).subquery()
+        total = int(
+            (
+                await self.db.execute(select(func.count()).select_from(union_stmt))
+            ).scalar_one()
+        )
+        pages = max(1, (total + page_size - 1) // page_size) if total else 1
+        page = min(max(1, page), pages)
+
+        rows = (
+            await self.db.execute(
+                select(union_stmt)
+                .order_by(union_stmt.c.created_at.desc(), union_stmt.c.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).mappings().all()
+
+        items = []
+        for row in rows:
+            items.append(await self._serialize_report_list_item(row))
+
+        view_counts = {"all": 0}
+        for reason in self.REPORT_REASONS:
+            count_stmt = self._reports_union_stmt(view=reason, query=query).subquery()
+            count = int(
+                (
+                    await self.db.execute(select(func.count()).select_from(count_stmt))
+                ).scalar_one()
+            )
+            view_counts[reason] = count
+            view_counts["all"] += count
+
+        return {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "pages": pages,
+            "view_counts": view_counts,
+        }
+
+    async def get_report_detail(self, target_type: str, report_id: int) -> dict:
+        report, target = await self._load_report_bundle(target_type, report_id)
+        reporter = report.reporter
+        owner = await self._resolve_reported_owner(target_type, target)
+        evidence = self._build_report_evidence(target_type, report, target)
+        history = await self._load_report_history(target_type, target, report.id)
+
+        return {
+            "id": report.id,
+            "target_type": target_type,
+            "reason": report.reason.value,
+            "status": report.status.value,
+            "details": report.details,
+            "created_at": report.created_at,
+            "resolved_at": report.resolved_at,
+            "reporter": {
+                "id": reporter.id,
+                "email": reporter.email,
+                "name": f"{reporter.first_name} {reporter.last_name}".strip(),
+            },
+            "reported_object": self._serialize_reported_object(
+                target_type, target, owner
+            ),
+            "owner": owner,
+            "evidence": evidence,
+            "history": history,
+        }
+
+    async def apply_report_action(
+        self,
+        target_type: str,
+        report_id: int,
+        action: str,
+        current_user: User,
+        reason: str | None = None,
+    ) -> dict:
+        allowed = {"dismiss", "warn", "suspend", "delete"}
+        if action not in allowed:
+            raise ValidationError("Unsupported report action")
+        if action in {"suspend", "delete"} and current_user.role == UserRole.moderator:
+            raise ForbiddenError("Moderator cannot perform this action")
+        if action in {"warn", "suspend", "delete"} and not (reason and reason.strip()):
+            raise ValidationError("Reason is required for this action")
+
+        report, target = await self._load_report_bundle(target_type, report_id)
+        if report.status != self._report_open_status(target_type):
+            raise ConflictError("Report is already closed")
+
+        owner = await self._resolve_reported_object_owner(target_type, target)
+        object_title = self._reported_object_title(target_type, target)
+        object_id = self._reported_object_id(target_type, target)
+        now = datetime.now(timezone.utc)
+
+        if action == "dismiss":
+            report.status = self._report_dismissed_status(target_type)
+            report.resolved_at = now
+            report.resolved_by_id = current_user.id
+        elif action == "warn":
+            report.status = self._report_resolved_status(target_type)
+            report.resolved_at = now
+            report.resolved_by_id = current_user.id
+            owner_user_id = owner.get("user_id") if owner else None
+            if owner_user_id:
+                title, body = self._report_action_notification(
+                    action, object_title, reason
+                )
+                self.db.add(
+                    Notification(
+                        user_id=owner_user_id,
+                        company_id=None,
+                        type=NotificationType.system,
+                        title=title,
+                        body=body,
+                        href=self._owner_href(target_type, object_id),
+                    )
+                )
+        elif action == "suspend":
+            report.status = self._report_resolved_status(target_type)
+            report.resolved_at = now
+            report.resolved_by_id = current_user.id
+            await self._suspend_reported_owner(owner, current_user, reason)
+            owner_user_id = owner.get("user_id") if owner else None
+            if owner_user_id:
+                title, body = self._report_action_notification(
+                    action, object_title, reason
+                )
+                self.db.add(
+                    Notification(
+                        user_id=owner_user_id,
+                        company_id=None,
+                        type=NotificationType.system,
+                        title=title,
+                        body=body,
+                        href=self._owner_href(target_type, object_id),
+                    )
+                )
+        elif action == "delete":
+            await log_audit(
+                self.db,
+                user_id=current_user.id,
+                action="admin.report.delete",
+                resource_type="report",
+                resource_id=f"{target_type}:{report.id}",
+                details={
+                    "reason": reason.strip() if reason else None,
+                    "target_type": target_type,
+                    "report_id": report.id,
+                    "object_id": object_id,
+                    "report_reason": report.reason.value,
+                    "status": "resolved",
+                },
+            )
+            await log_audit(
+                self.db,
+                user_id=current_user.id,
+                action="admin.report.delete",
+                resource_type=self._object_resource_type(target_type),
+                resource_id=str(object_id),
+                details={
+                    "reason": reason.strip() if reason else None,
+                    "report_id": report.id,
+                    "target_type": target_type,
+                },
+            )
+            owner_user_id = owner.get("user_id") if owner else None
+            if owner_user_id:
+                title, body = self._report_action_notification(
+                    action, object_title, reason
+                )
+                self.db.add(
+                    Notification(
+                        user_id=owner_user_id,
+                        company_id=None,
+                        type=NotificationType.system,
+                        title=title,
+                        body=body,
+                        href=self._owner_href(target_type, object_id),
+                    )
+                )
+            report.status = self._report_resolved_status(target_type)
+            report.resolved_at = now
+            report.resolved_by_id = current_user.id
+            await self.db.flush()
+            await self._delete_reported_object(
+                target_type, target, current_user, reason
+            )
+            await self.db.flush()
+            return {
+                "id": report_id,
+                "target_type": target_type,
+                "action": action,
+                "status": "resolved",
+            }
+
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.report.{action}",
+            resource_type="report",
+            resource_id=f"{target_type}:{report.id}",
+            details={
+                "reason": reason.strip() if reason else None,
+                "target_type": target_type,
+                "report_id": report.id,
+                "object_id": object_id,
+                "report_reason": report.reason.value,
+                "status": report.status.value,
+            },
+        )
+        await log_audit(
+            self.db,
+            user_id=current_user.id,
+            action=f"admin.report.{action}",
+            resource_type=self._object_resource_type(target_type),
+            resource_id=str(object_id),
+            details={
+                "reason": reason.strip() if reason else None,
+                "report_id": report.id,
+                "target_type": target_type,
+            },
+        )
+        await self.db.flush()
+        return {
+            "id": report.id,
+            "target_type": target_type,
+            "action": action,
+            "status": report.status.value,
+        }
+
+    def _reports_union_stmt(self, view: str, query: str | None):
+        reason_filter = None if view == "all" else view
+        normalized_query = query.strip() if query else ""
+        search_pattern = f"%{normalized_query}%" if normalized_query else None
+
+        catalog_filters = [CatalogItemReport.status == CatalogItemReportStatus.open]
+        if reason_filter:
+            catalog_filters.append(
+                CatalogItemReport.reason == CatalogItemReportReason(reason_filter)
+            )
+
+        rfq_filters = [RfqReport.status == RfqReportStatus.open]
+        if reason_filter:
+            rfq_filters.append(RfqReport.reason == RfqReportReason(reason_filter))
+
+        proposal_filters = [ProposalReport.status == ProposalReportStatus.open]
+        if reason_filter:
+            proposal_filters.append(
+                ProposalReport.reason == ProposalReportReason(reason_filter)
+            )
+
+        catalog_q = (
+            select(
+                CatalogItemReport.id.label("id"),
+                literal("catalog").label("target_type"),
+                cast(CatalogItemReport.reason, String).label("reason"),
+                CatalogItemReport.details.label("details"),
+                cast(CatalogItemReport.status, String).label("status"),
+                CatalogItemReport.created_at.label("created_at"),
+                CatalogItemReport.reporter_user_id.label("reporter_user_id"),
+                cast(CatalogItemReport.item_id, String).label("object_id"),
+            )
+            .join(CatalogItem, CatalogItem.id == CatalogItemReport.item_id)
+            .join(User, User.id == CatalogItemReport.reporter_user_id)
+            .where(*catalog_filters)
+        )
+        rfq_q = (
+            select(
+                RfqReport.id.label("id"),
+                literal("rfq").label("target_type"),
+                cast(RfqReport.reason, String).label("reason"),
+                RfqReport.details.label("details"),
+                cast(RfqReport.status, String).label("status"),
+                RfqReport.created_at.label("created_at"),
+                RfqReport.reporter_user_id.label("reporter_user_id"),
+                RfqReport.rfq_id.label("object_id"),
+            )
+            .join(Rfq, Rfq.id == RfqReport.rfq_id)
+            .join(User, User.id == RfqReport.reporter_user_id)
+            .where(*rfq_filters)
+        )
+        proposal_q = (
+            select(
+                ProposalReport.id.label("id"),
+                literal("proposal").label("target_type"),
+                cast(ProposalReport.reason, String).label("reason"),
+                ProposalReport.details.label("details"),
+                cast(ProposalReport.status, String).label("status"),
+                ProposalReport.created_at.label("created_at"),
+                ProposalReport.reporter_user_id.label("reporter_user_id"),
+                cast(ProposalReport.proposal_id, String).label("object_id"),
+            )
+            .join(Proposal, Proposal.id == ProposalReport.proposal_id)
+            .join(User, User.id == ProposalReport.reporter_user_id)
+            .where(*proposal_filters)
+        )
+
+        if search_pattern:
+            catalog_q = catalog_q.where(
+                or_(
+                    CatalogItem.title.ilike(search_pattern),
+                    CatalogItemReport.details.ilike(search_pattern),
+                    User.email.ilike(search_pattern),
+                    User.first_name.ilike(search_pattern),
+                    User.last_name.ilike(search_pattern),
+                    cast(CatalogItemReport.id, String).ilike(search_pattern),
+                )
+            )
+            rfq_q = rfq_q.where(
+                or_(
+                    Rfq.title.ilike(search_pattern),
+                    RfqReport.details.ilike(search_pattern),
+                    User.email.ilike(search_pattern),
+                    User.first_name.ilike(search_pattern),
+                    User.last_name.ilike(search_pattern),
+                    cast(RfqReport.id, String).ilike(search_pattern),
+                    RfqReport.rfq_id.ilike(search_pattern),
+                )
+            )
+            proposal_q = proposal_q.where(
+                or_(
+                    Proposal.message.ilike(search_pattern),
+                    ProposalReport.details.ilike(search_pattern),
+                    User.email.ilike(search_pattern),
+                    User.first_name.ilike(search_pattern),
+                    User.last_name.ilike(search_pattern),
+                    cast(ProposalReport.id, String).ilike(search_pattern),
+                    cast(ProposalReport.proposal_id, String).ilike(search_pattern),
+                )
+            )
+
+        return union_all(catalog_q, rfq_q, proposal_q)
+
+    async def _serialize_report_list_item(self, row) -> dict:
+        reporter = (
+            await self.db.execute(select(User).where(User.id == row["reporter_user_id"]))
+        ).scalar_one_or_none()
+        target_type = row["target_type"]
+        object_id = row["object_id"]
+        title = "—"
+        href = "/"
+        if target_type == "catalog":
+            item = (
+                await self.db.execute(
+                    select(CatalogItem).where(CatalogItem.id == int(object_id))
+                )
+            ).scalar_one_or_none()
+            if item:
+                title = item.title
+                href = f"/admin/catalog/{item.id}"
+        elif target_type == "rfq":
+            rfq = (
+                await self.db.execute(select(Rfq).where(Rfq.id == object_id))
+            ).scalar_one_or_none()
+            if rfq:
+                title = rfq.title
+                href = f"/admin/rfqs/{rfq.id}"
+        elif target_type == "proposal":
+            proposal = (
+                await self.db.execute(
+                    select(Proposal).where(Proposal.id == int(object_id))
+                )
+            ).scalar_one_or_none()
+            if proposal:
+                title = (proposal.message or f"Предложение #{proposal.id}")[:120]
+                href = f"/admin/proposals/{proposal.id}"
+
+        details = row["details"] or ""
+        return {
+            "id": row["id"],
+            "target_type": target_type,
+            "reason": row["reason"],
+            "status": row["status"],
+            "details_preview": details[:160] if details else None,
+            "created_at": row["created_at"],
+            "reporter": {
+                "id": reporter.id if reporter else 0,
+                "email": reporter.email if reporter else "",
+                "name": (
+                    f"{reporter.first_name} {reporter.last_name}".strip()
+                    if reporter
+                    else "—"
+                ),
+            },
+            "reported_object": {
+                "type": target_type,
+                "id": object_id,
+                "title": title,
+                "href": href,
+            },
+        }
+
+    async def _load_report_bundle(self, target_type: str, report_id: int):
+        if target_type not in self.REPORT_TARGET_TYPES:
+            raise ValidationError("Unsupported report target type")
+        if target_type == "catalog":
+            result = await self.db.execute(
+                select(CatalogItemReport)
+                .where(CatalogItemReport.id == report_id)
+                .options(
+                    selectinload(CatalogItemReport.reporter),
+                    selectinload(CatalogItemReport.item).selectinload(CatalogItem.media),
+                )
+            )
+            report = result.scalar_one_or_none()
+            if not report or not report.item:
+                raise NotFoundError("Report not found")
+            return report, report.item
+        if target_type == "rfq":
+            result = await self.db.execute(
+                select(RfqReport)
+                .where(RfqReport.id == report_id)
+                .options(
+                    selectinload(RfqReport.reporter),
+                    selectinload(RfqReport.rfq).selectinload(Rfq.attachments),
+                )
+            )
+            report = result.scalar_one_or_none()
+            if not report or not report.rfq:
+                raise NotFoundError("Report not found")
+            return report, report.rfq
+        result = await self.db.execute(
+            select(ProposalReport)
+            .where(ProposalReport.id == report_id)
+            .options(
+                selectinload(ProposalReport.reporter),
+                selectinload(ProposalReport.proposal).selectinload(Proposal.attachment),
+                selectinload(ProposalReport.proposal).selectinload(Proposal.contract),
+            )
+        )
+        report = result.scalar_one_or_none()
+        if not report or not report.proposal:
+            raise NotFoundError("Report not found")
+        return report, report.proposal
+
+    async def _resolve_reported_owner(self, target_type: str, target) -> dict | None:
+        return await self._resolve_reported_object_owner(target_type, target)
+
+    async def _resolve_reported_object_owner(
+        self, target_type: str, target
+    ) -> dict | None:
+        if target_type == "catalog":
+            owners = await self._load_catalog_owners([target.actor_id])
+            return owners.get(target.actor_id)
+        if target_type == "rfq":
+            owners = await self._load_catalog_owners([target.actor_id])
+            return owners.get(target.actor_id)
+        owners = await self._load_catalog_owners([target.supplier_actor_id])
+        return owners.get(target.supplier_actor_id)
+
+    def _serialize_reported_object(
+        self, target_type: str, target, owner: dict | None
+    ) -> dict:
+        object_id = self._reported_object_id(target_type, target)
+        return {
+            "type": target_type,
+            "id": str(object_id),
+            "title": self._reported_object_title(target_type, target),
+            "href": self._admin_href(target_type, object_id),
+            "status": getattr(getattr(target, "status", None), "value", None),
+            "owner": owner,
+        }
+
+    @staticmethod
+    def _reported_object_id(target_type: str, target):
+        if target_type == "catalog":
+            return target.id
+        if target_type == "rfq":
+            return target.id
+        return target.id
+
+    @staticmethod
+    def _reported_object_title(target_type: str, target) -> str:
+        if target_type == "catalog":
+            return target.title
+        if target_type == "rfq":
+            return target.title
+        return (target.message or f"Предложение #{target.id}")[:200]
+
+    @staticmethod
+    def _admin_href(target_type: str, object_id) -> str:
+        if target_type == "catalog":
+            return f"/admin/catalog/{object_id}"
+        if target_type == "rfq":
+            return f"/admin/rfqs/{object_id}"
+        return f"/admin/proposals/{object_id}"
+
+    @staticmethod
+    def _owner_href(target_type: str, object_id) -> str:
+        if target_type == "catalog":
+            return f"/supplier/catalog/{object_id}"
+        if target_type == "rfq":
+            return f"/customer/rfqs/{object_id}"
+        return f"/supplier/proposals/{object_id}"
+
+    @staticmethod
+    def _object_resource_type(target_type: str) -> str:
+        if target_type == "catalog":
+            return "catalog_item"
+        if target_type == "rfq":
+            return "rfq"
+        return "proposal"
+
+    @staticmethod
+    def _report_open_status(target_type: str):
+        if target_type == "catalog":
+            return CatalogItemReportStatus.open
+        if target_type == "rfq":
+            return RfqReportStatus.open
+        return ProposalReportStatus.open
+
+    @staticmethod
+    def _report_dismissed_status(target_type: str):
+        if target_type == "catalog":
+            return CatalogItemReportStatus.dismissed
+        if target_type == "rfq":
+            return RfqReportStatus.dismissed
+        return ProposalReportStatus.dismissed
+
+    @staticmethod
+    def _report_resolved_status(target_type: str):
+        if target_type == "catalog":
+            return CatalogItemReportStatus.resolved
+        if target_type == "rfq":
+            return RfqReportStatus.resolved
+        return ProposalReportStatus.resolved
+
+    def _build_report_evidence(self, target_type: str, report, target) -> dict:
+        files: list[dict] = []
+        if target_type == "catalog":
+            for media in sorted(target.media or [], key=lambda m: m.sort_order):
+                files.append(
+                    {
+                        "file_name": media.file_name,
+                        "file_url": media.file_url,
+                        "file_type": media.media_type.value,
+                    }
+                )
+        elif target_type == "rfq":
+            for attachment in target.attachments or []:
+                files.append(
+                    {
+                        "file_name": attachment.file_name,
+                        "file_url": attachment.file_url,
+                        "file_type": attachment.file_type,
+                    }
+                )
+        elif target_type == "proposal" and target.attachment:
+            files.append(
+                {
+                    "file_name": target.attachment.file_name,
+                    "file_url": target.attachment.file_url,
+                    "file_type": target.attachment.file_type,
+                }
+            )
+        return {"details": report.details, "files": files}
+
+    async def _load_report_history(
+        self, target_type: str, target, report_id: int
+    ) -> list[dict]:
+        object_id = str(self._reported_object_id(target_type, target))
+        resource_type = self._object_resource_type(target_type)
+        result = await self.db.execute(
+            select(AuditLog)
+            .where(
+                or_(
+                    (
+                        (AuditLog.resource_type == resource_type)
+                        & (AuditLog.resource_id == object_id)
+                    ),
+                    (
+                        (AuditLog.resource_type == "report")
+                        & (AuditLog.resource_id == f"{target_type}:{report_id}")
+                    ),
+                )
+            )
+            .options(selectinload(AuditLog.user))
+            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        )
+        history = result.scalars().unique().all()
+        return [
+            {
+                "id": entry.id,
+                "action": entry.action,
+                "details": entry.details or {},
+                "created_at": entry.created_at,
+                "actor": (
+                    {
+                        "id": entry.user.id,
+                        "email": entry.user.email,
+                        "name": f"{entry.user.first_name} {entry.user.last_name}".strip(),
+                    }
+                    if entry.user
+                    else None
+                ),
+            }
+            for entry in history
+        ]
+
+    async def _suspend_reported_owner(
+        self, owner: dict | None, current_user: User, reason: str | None
+    ) -> None:
+        if not owner:
+            raise ValidationError("Reported object has no owner to suspend")
+        company_id = owner.get("company_id")
+        user_id = owner.get("user_id")
+        if company_id:
+            await self.apply_company_action(
+                company_id=company_id,
+                action="block",
+                current_user=current_user,
+                reason=reason,
+            )
+            return
+        if not user_id:
+            raise ValidationError("Reported object has no owner to suspend")
+        await self.update_user_status(
+            user_id=user_id,
+            status="blocked",
+            current_user=current_user,
+        )
+
+    async def _delete_reported_object(
+        self,
+        target_type: str,
+        target,
+        current_user: User,
+        reason: str | None,
+    ) -> None:
+        if target_type == "catalog":
+            await self.apply_catalog_action(
+                item_id=target.id,
+                action="delete",
+                current_user=current_user,
+                reason=reason,
+            )
+            return
+        if target_type == "rfq":
+            await self.apply_rfq_action(
+                rfq_id=target.id,
+                action="delete",
+                current_user=current_user,
+                reason=reason,
+            )
+            return
+        await self.apply_proposal_action(
+            proposal_id=target.id,
+            action="delete",
+            current_user=current_user,
+            reason=reason,
+        )
+
+    @staticmethod
+    def _report_action_notification(
+        action: str, object_title: str, reason: str | None
+    ) -> tuple[str, str]:
+        messages = {
+            "warn": (
+                "Предупреждение модерации",
+                f"По объекту «{object_title}» вынесено предупреждение.",
+            ),
+            "suspend": (
+                "Аккаунт приостановлен",
+                f"Из-за жалобы на «{object_title}» доступ приостановлен.",
+            ),
+            "delete": (
+                "Объект удалён модерацией",
+                f"Объект «{object_title}» удалён по результатам жалобы.",
             ),
         }
         title, body = messages[action]

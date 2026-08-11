@@ -56,6 +56,29 @@ class SubscriptionService:
         sub.plan = SupplierSubscriptionPlan(plan)
         sub.active_until = datetime.now(timezone.utc) + THIRTY_DAYS
         await self.db.flush()
+        from src.modules.finance.ledger import (
+            SUBSCRIPTION_PLAN_AMOUNTS,
+            FinanceLedgerService,
+        )
+        from src.models import (
+            PlatformPaymentGateway,
+            PlatformPaymentStatus,
+            PlatformPaymentType,
+        )
+
+        amount = SUBSCRIPTION_PLAN_AMOUNTS.get(plan, 0.0)
+        if amount > 0:
+            await FinanceLedgerService(self.db).record(
+                payment_type=PlatformPaymentType.subscription,
+                amount=amount,
+                currency="RUB",
+                title=f"Подписка {plan}",
+                description=f"Активация тарифа {plan} на 30 дней",
+                status=PlatformPaymentStatus.paid,
+                gateway=PlatformPaymentGateway.mock,
+                subscription_user_id=user_id,
+                metadata={"plan": plan},
+            )
         return await self.get_subscription(user_id)
 
     async def cancel(self, user_id: int) -> SubscriptionResponse:
