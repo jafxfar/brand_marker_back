@@ -188,7 +188,7 @@ class CompanyService:
                 selectinload(Company.categories),
                 selectinload(Company.certificates),
                 selectinload(Company.reviews_received),
-                selectinload(Company.members),
+                selectinload(Company.members).selectinload(CompanyUser.user),
             )
         )
         if query:

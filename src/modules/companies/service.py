@@ -230,7 +230,7 @@ class CompanyService:
                 selectinload(Company.categories),
                 selectinload(Company.certificates),
                 selectinload(Company.actors),
-                selectinload(Company.members),
+                selectinload(Company.members).selectinload(CompanyUser.user),
             )
         )
         if query:
