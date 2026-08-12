@@ -1,4 +1,4 @@
-from src.models import Actor, ActorKind, Company, CompanyUser, Contract, Proposal, Rfq
+from src.models import Actor, ActorKind, Company, CompanyUser, Contract, Message, Proposal, Rfq
 from src.modules.companies.schemas import (
     CompanyCategorySchema,
     CompanyCertificateSchema,
@@ -8,6 +8,53 @@ from src.modules.companies.schemas import (
     CompanyWithRelations,
     ReviewSchema,
 )
+
+
+def _user_display_name(user) -> str:
+    if not user:
+        return "Участник"
+    name = f"{user.first_name} {user.last_name}".strip()
+    return name or user.email or "Участник"
+
+
+def _message_to_dict(msg: Message) -> dict:
+    return {
+        "id": msg.id,
+        "conversation_id": msg.conversation_id,
+        "sender_id": msg.sender_id,
+        "sender_name": _user_display_name(getattr(msg, "sender", None)),
+        "text": msg.text,
+        "attachment": None,
+        "created_at": msg.created_at,
+    }
+
+
+def _submission_assets(submission) -> list[dict]:
+    raw = getattr(submission, "assets", None) or []
+    result: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind") or "file"
+        name = item.get("name") or ""
+        url = item.get("url") or ""
+        if not name or not url:
+            continue
+        result.append(
+            {
+                "kind": kind,
+                "name": name,
+                "url": url,
+                "file_type": item.get("file_type"),
+            }
+        )
+    if result:
+        return result
+    return [
+        {"kind": "file", "name": name, "url": "#", "file_type": None}
+        for name in (submission.file_names or [])
+        if name
+    ]
 
 
 def company_to_schema(company: Company) -> CompanyWithRelations:
@@ -177,15 +224,7 @@ def contract_to_schema(contract: Contract) -> dict:
             "id": contract.conversation.id,
             "contract_id": contract.conversation.contract_id,
             "messages": [
-                {
-                    "id": msg.id,
-                    "conversation_id": msg.conversation_id,
-                    "sender_id": msg.sender_id,
-                    "text": msg.text,
-                    "attachment": None,
-                    "created_at": msg.created_at,
-                }
-                for msg in contract.conversation.messages
+                _message_to_dict(msg) for msg in contract.conversation.messages
             ],
         }
     return {
@@ -225,7 +264,8 @@ def contract_to_schema(contract: Contract) -> dict:
                 "note": s.note,
                 "status": s.status.value,
                 "submitted_at": s.submitted_at,
-                "file_names": s.file_names,
+                "file_names": s.file_names or [a["name"] for a in _submission_assets(s)],
+                "assets": _submission_assets(s),
             }
             for s in contract.submissions
         ],

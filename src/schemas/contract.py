@@ -40,6 +40,7 @@ class MessageSchema(BaseModel):
     id: int
     conversation_id: int
     sender_id: int
+    sender_name: str = ""
     text: str
     attachment: MessageAttachmentSchema | None = None
     created_at: datetime | None = None
@@ -65,6 +66,13 @@ class ContractFileSchema(BaseModel):
     created_at: datetime
 
 
+class SubmissionAssetSchema(BaseModel):
+    kind: str
+    name: str
+    url: str
+    file_type: str | None = None
+
+
 class WorkSubmissionSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -75,6 +83,7 @@ class WorkSubmissionSchema(BaseModel):
     status: str
     submitted_at: datetime
     file_names: list[str]
+    assets: list[SubmissionAssetSchema] = []
 
 
 class ContractSchema(BaseModel):
@@ -107,10 +116,18 @@ class MessageCreate(BaseModel):
     text: str = Field(min_length=1)
 
 
+class SubmissionAssetCreate(BaseModel):
+    kind: str = Field(pattern="^(image|video|file|link)$")
+    name: str = Field(min_length=1)
+    url: str = Field(min_length=1)
+    file_type: str | None = None
+
+
 class WorkSubmissionCreate(BaseModel):
     type: str = "delivery"
     note: str = ""
     file_names: list[str] = []
+    assets: list[SubmissionAssetCreate] = []
 
 
 class DisputeRequest(BaseModel):

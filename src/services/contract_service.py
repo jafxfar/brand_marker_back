@@ -101,7 +101,9 @@ class ContractService:
             .where(Contract.id == contract_id)
             .options(
                 selectinload(Contract.payment_plan).selectinload(PaymentPlan.milestones),
-                selectinload(Contract.conversation).selectinload(Conversation.messages),
+                selectinload(Contract.conversation)
+                .selectinload(Conversation.messages)
+                .selectinload(Message.sender),
                 selectinload(Contract.files),
                 selectinload(Contract.submissions),
                 selectinload(Contract.rfq),
@@ -161,7 +163,9 @@ class ContractService:
         result = await self.db.execute(
             stmt.options(
                 selectinload(Contract.payment_plan).selectinload(PaymentPlan.milestones),
-                selectinload(Contract.conversation).selectinload(Conversation.messages),
+                selectinload(Contract.conversation)
+                .selectinload(Conversation.messages)
+                .selectinload(Message.sender),
                 selectinload(Contract.files),
                 selectinload(Contract.submissions),
             ).order_by(Contract.created_at.desc())
@@ -216,12 +220,23 @@ class ContractService:
             raise ForbiddenError("Access denied")
         if contract.status not in (ContractStatus.active, ContractStatus.pending_payment):
             raise ConflictError("Contract not active")
+        assets = [
+            {
+                "kind": a.kind,
+                "name": a.name,
+                "url": a.url,
+                "file_type": a.file_type,
+            }
+            for a in getattr(data, "assets", []) or []
+        ]
+        file_names = data.file_names or [a["name"] for a in assets]
         sub = WorkSubmission(
             contract_id=contract_id,
             type=WorkSubmissionType(data.type),
             note=data.note,
             status=WorkSubmissionStatus.pending,
-            file_names=data.file_names,
+            file_names=file_names,
+            assets=assets,
         )
         self.db.add(sub)
         contract.status = ContractStatus.delivered

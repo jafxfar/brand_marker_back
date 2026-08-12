@@ -623,6 +623,7 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+    sender: Mapped["User"] = relationship(foreign_keys=[sender_id])
     attachment: Mapped["MessageAttachment | None"] = relationship(back_populates="message", uselist=False)
 
 
@@ -753,6 +754,7 @@ class WorkSubmission(Base):
     )
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     file_names: Mapped[list[str]] = mapped_column(ARRAY(String), default=list)
+    assets: Mapped[list] = mapped_column(JSONB, default=list)
 
     contract: Mapped["Contract"] = relationship(back_populates="submissions")
 

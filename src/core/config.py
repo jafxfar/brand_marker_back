@@ -33,10 +33,12 @@ class Settings(BaseSettings):
     s3_use_ssl: bool = False
     local_upload_dir: str = "./uploads"
 
-    max_upload_size_mb: int = 10
+    max_upload_size_mb: int = 50
     allowed_upload_mime_types: str = (
-        "application/pdf,image/jpeg,image/png,image/webp,"
-        "application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        "application/pdf,image/jpeg,image/png,image/webp,image/gif,"
+        "video/mp4,video/webm,"
+        "application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,"
+        "application/zip,application/x-zip-compressed,application/octet-stream"
     )
 
     @field_validator("cors_origins", mode="before")

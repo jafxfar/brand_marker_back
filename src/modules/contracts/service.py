@@ -137,7 +137,9 @@ class ContractService:
             .where(Contract.id == contract_id)
             .options(
                 selectinload(Contract.payment_plan).selectinload(PaymentPlan.milestones),
-                selectinload(Contract.conversation).selectinload(Conversation.messages),
+                selectinload(Contract.conversation)
+                .selectinload(Conversation.messages)
+                .selectinload(Message.sender),
                 selectinload(Contract.files),
                 selectinload(Contract.submissions),
                 selectinload(Contract.rfq),
@@ -206,7 +208,9 @@ class ContractService:
         result = await self.db.execute(
             stmt.options(
                 selectinload(Contract.payment_plan).selectinload(PaymentPlan.milestones),
-                selectinload(Contract.conversation).selectinload(Conversation.messages),
+                selectinload(Contract.conversation)
+                .selectinload(Conversation.messages)
+                .selectinload(Message.sender),
                 selectinload(Contract.files),
                 selectinload(Contract.submissions),
             ).order_by(Contract.created_at.desc())
@@ -249,6 +253,13 @@ class ContractService:
         )
         self.db.add(msg)
         await self.db.flush()
+        await self.db.refresh(msg, attribute_names=["sender"])
+
+        sender_name = ""
+        if msg.sender:
+            sender_name = f"{msg.sender.first_name} {msg.sender.last_name}".strip()
+            if not sender_name:
+                sender_name = msg.sender.email or ""
 
         recipient_actor_id = (
             contract.supplier_actor_id
@@ -268,6 +279,7 @@ class ContractService:
                         "message": {
                             "id": msg.id,
                             "sender_id": user_id,
+                            "sender_name": sender_name or f"User #{user_id}",
                             "text": msg.text,
                             "created_at": msg.created_at.isoformat() if msg.created_at else None,
                         },
@@ -303,12 +315,23 @@ class ContractService:
             raise ForbiddenError("Access denied")
         if contract.status not in (ContractStatus.active, ContractStatus.pending_payment):
             raise ConflictError("Contract not active")
+        assets = [
+            {
+                "kind": a.kind,
+                "name": a.name,
+                "url": a.url,
+                "file_type": a.file_type,
+            }
+            for a in data.assets
+        ]
+        file_names = data.file_names or [a["name"] for a in assets]
         sub = WorkSubmission(
             contract_id=contract_id,
             type=WorkSubmissionType(data.type),
             note=data.note,
             status=WorkSubmissionStatus.pending,
-            file_names=data.file_names,
+            file_names=file_names,
+            assets=assets,
         )
         self.db.add(sub)
         contract.status = ContractStatus.delivered
