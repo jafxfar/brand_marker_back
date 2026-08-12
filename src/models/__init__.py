@@ -411,7 +411,7 @@ class RfqInvitedSupplier(Base):
 
 
 class Currency(str, enum.Enum):
-    RUB = "RUB"
+    TJS = "TJS"
     USD = "USD"
     EUR = "EUR"
     KZT = "KZT"
@@ -613,6 +613,12 @@ class Conversation(Base):
     messages: Mapped[list["Message"]] = relationship(back_populates="conversation")
 
 
+class MessageDeliveryStatus(str, enum.Enum):
+    sent = "sent"
+    delivered = "delivered"
+    viewed = "viewed"
+
+
 class Message(Base):
     __tablename__ = "messages"
 
@@ -621,6 +627,16 @@ class Message(Base):
     sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    status: Mapped[MessageDeliveryStatus] = mapped_column(
+        Enum(MessageDeliveryStatus, name="message_delivery_status"),
+        default=MessageDeliveryStatus.sent,
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    viewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
     sender: Mapped["User"] = relationship(foreign_keys=[sender_id])
@@ -939,7 +955,7 @@ class ItemPricing(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("catalog_items.id", ondelete="CASCADE"), unique=True)
     pricing_type: Mapped[PricingType] = mapped_column(Enum(PricingType, name="pricing_type"))
-    currency: Mapped[str] = mapped_column(String(10), default="RUB")
+    currency: Mapped[str] = mapped_column(String(10), default="TJS")
     fixed_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     hourly_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     monthly_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -992,66 +1008,6 @@ class SupplierSubscription(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
-class OrderKind(str, enum.Enum):
-    product = "product"
-    service = "service"
-
-
-class OrderStatus(str, enum.Enum):
-    published = "published"
-    in_progress = "in_progress"
-    completed = "completed"
-    cancelled = "cancelled"
-    disputed = "disputed"
-
-
-class OrderOfferStatus(str, enum.Enum):
-    pending = "pending"
-    accepted = "accepted"
-    rejected = "rejected"
-    withdrawn = "withdrawn"
-
-
-class MarketplaceOrder(Base):
-    __tablename__ = "marketplace_orders"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    buyer_actor_id: Mapped[int] = mapped_column(ForeignKey("actors.id"), index=True)
-    kind: Mapped[OrderKind] = mapped_column(Enum(OrderKind, name="order_kind"))
-    title: Mapped[str] = mapped_column(String(255))
-    description: Mapped[str] = mapped_column(Text, default="")
-    category_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id"), nullable=True)
-    category_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    budget: Mapped[float] = mapped_column(Float, default=0)
-    qty: Mapped[int] = mapped_column(Integer, default=1)
-    needs_delivery: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[OrderStatus] = mapped_column(
-        Enum(OrderStatus, name="order_status"), default=OrderStatus.published
-    )
-    accepted_offer_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    offers: Mapped[list["OrderOffer"]] = relationship(back_populates="order", cascade="all, delete-orphan")
-
-
-class OrderOffer(Base):
-    __tablename__ = "order_offers"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    order_id: Mapped[str] = mapped_column(ForeignKey("marketplace_orders.id", ondelete="CASCADE"), index=True)
-    supplier_actor_id: Mapped[int] = mapped_column(ForeignKey("actors.id"), index=True)
-    supplier_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    price: Mapped[float] = mapped_column(Float)
-    message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    delivery_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    status: Mapped[OrderOfferStatus] = mapped_column(
-        Enum(OrderOfferStatus, name="order_offer_status"), default=OrderOfferStatus.pending
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-
-    order: Mapped["MarketplaceOrder"] = relationship(back_populates="offers")
-
-
 class WithdrawalDestinationType(str, enum.Enum):
     bank = "bank"
     wallet = "wallet"
@@ -1093,7 +1049,7 @@ class Withdrawal(Base):
     actor_id: Mapped[int] = mapped_column(ForeignKey("actors.id"), index=True)
     destination_id: Mapped[int] = mapped_column(ForeignKey("withdrawal_destinations.id"))
     amount: Mapped[float] = mapped_column(Float)
-    currency: Mapped[str] = mapped_column(String(10), default="RUB")
+    currency: Mapped[str] = mapped_column(String(10), default="TJS")
     status: Mapped[WithdrawalStatus] = mapped_column(
         Enum(WithdrawalStatus, name="withdrawal_status"), default=WithdrawalStatus.pending
     )
@@ -1110,7 +1066,7 @@ class SupplierInvoice(Base):
     number: Mapped[str] = mapped_column(String(100))
     title: Mapped[str] = mapped_column(String(255))
     amount: Mapped[float] = mapped_column(Float)
-    currency: Mapped[str] = mapped_column(String(10), default="RUB")
+    currency: Mapped[str] = mapped_column(String(10), default="TJS")
     status: Mapped[InvoiceStatus] = mapped_column(
         Enum(InvoiceStatus, name="invoice_status"), default=InvoiceStatus.issued
     )
@@ -1161,7 +1117,7 @@ class PlatformPayment(Base):
     )
     amount: Mapped[float] = mapped_column(Float)
     commission: Mapped[float] = mapped_column(Float, default=0.0)
-    currency: Mapped[str] = mapped_column(String(10), default="RUB")
+    currency: Mapped[str] = mapped_column(String(10), default="TJS")
     title: Mapped[str] = mapped_column(String(255))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     actor_id: Mapped[int | None] = mapped_column(

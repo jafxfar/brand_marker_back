@@ -54,6 +54,14 @@ class ReviewService:
         )
         return [ReviewResponse.model_validate(r) for r in result.scalars().all()]
 
+    async def list_for_actor(self, actor_id: int) -> list[ReviewResponse]:
+        result = await self.db.execute(
+            select(Review)
+            .where(Review.target_actor_id == actor_id)
+            .order_by(Review.created_at.desc())
+        )
+        return [ReviewResponse.model_validate(r) for r in result.scalars().all()]
+
     async def list_for_reviewer(self, reviewer_actor_id: int) -> list[ReviewResponse]:
         result = await self.db.execute(
             select(Review)

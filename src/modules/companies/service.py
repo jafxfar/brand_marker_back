@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -9,6 +9,7 @@ from src.models import (
     Actor,
     ActorKind,
     ActorType,
+    CatalogItem,
     Category,
     Company,
     CompanyCategory,
@@ -17,6 +18,8 @@ from src.models import (
     CompanyRole,
     CompanyStats,
     CompanyUser,
+    ItemStatus,
+    Review,
     User,
     UserRole,
     VerificationStatus,
@@ -28,6 +31,7 @@ from src.modules.companies.schemas import (
     CompanyUpdateRequest,
     CompanyWizardInput,
     CompanyWithRelations,
+    PublicSupplier,
 )
 from src.shared.serializers import company_to_schema
 
@@ -215,38 +219,128 @@ class CompanyService:
 
     async def list_suppliers(
         self, query: str | None = None, category_slug: str | None = None
-    ) -> list[CompanyWithRelations]:
+    ) -> list[PublicSupplier]:
         stmt = (
-            select(Company)
-            .join(Actor, Actor.company_id == Company.id)
+            select(Actor)
             .where(
-                Actor.kind == ActorKind.company,
                 Actor.side == ActorType.supplier,
                 Actor.is_active.is_(True),
             )
             .options(
-                selectinload(Company.profile),
-                selectinload(Company.stats),
-                selectinload(Company.categories),
-                selectinload(Company.certificates),
-                selectinload(Company.actors),
-                selectinload(Company.members).selectinload(CompanyUser.user),
+                selectinload(Actor.company).selectinload(Company.profile),
+                selectinload(Actor.company).selectinload(Company.stats),
+                selectinload(Actor.company).selectinload(Company.categories),
+                selectinload(Actor.user),
             )
+            .order_by(Actor.display_name.asc())
         )
         if query:
             pattern = f"%{query}%"
-            stmt = stmt.where(
-                or_(Company.title.ilike(pattern), Company.description.ilike(pattern))
+            stmt = (
+                stmt.outerjoin(Company, Actor.company_id == Company.id)
+                .outerjoin(User, Actor.user_id == User.id)
+                .where(
+                    or_(
+                        Actor.display_name.ilike(pattern),
+                        Company.title.ilike(pattern),
+                        Company.description.ilike(pattern),
+                        User.first_name.ilike(pattern),
+                        User.last_name.ilike(pattern),
+                    )
+                )
             )
         if category_slug:
             stmt = (
-                stmt.join(CompanyCategory, CompanyCategory.company_id == Company.id)
+                stmt.join(Company, Actor.company_id == Company.id)
+                .join(CompanyCategory, CompanyCategory.company_id == Company.id)
                 .join(Category, Category.id == CompanyCategory.category_id)
-                .where(Category.slug == category_slug)
+                .where(
+                    Actor.kind == ActorKind.company,
+                    Category.slug == category_slug,
+                )
             )
         result = await self.db.execute(stmt)
-        companies = result.scalars().unique().all()
-        return [company_to_schema(c) for c in companies]
+        actors = result.scalars().unique().all()
+        return [await self._actor_to_public_supplier(actor) for actor in actors]
+
+    async def get_public_supplier(self, actor_id: int) -> PublicSupplier:
+        result = await self.db.execute(
+            select(Actor)
+            .where(
+                Actor.id == actor_id,
+                Actor.side == ActorType.supplier,
+                Actor.is_active.is_(True),
+            )
+            .options(
+                selectinload(Actor.company).selectinload(Company.profile),
+                selectinload(Actor.company).selectinload(Company.stats),
+                selectinload(Actor.company).selectinload(Company.categories),
+                selectinload(Actor.user),
+            )
+        )
+        actor = result.scalar_one_or_none()
+        if not actor:
+            raise NotFoundError("Supplier not found")
+        return await self._actor_to_public_supplier(actor)
+
+    async def _actor_to_public_supplier(self, actor: Actor) -> PublicSupplier:
+        reviews_count_result = await self.db.execute(
+            select(func.count(Review.id)).where(Review.target_actor_id == actor.id)
+        )
+        reviews_count = int(reviews_count_result.scalar() or 0)
+
+        catalog_count_result = await self.db.execute(
+            select(func.count(CatalogItem.id)).where(
+                CatalogItem.actor_id == actor.id,
+                CatalogItem.status == ItemStatus.active,
+            )
+        )
+        active_catalog_count = int(catalog_count_result.scalar() or 0)
+
+        company = actor.company
+        if actor.kind == ActorKind.company and company:
+            rating = float(company.rating or 0)
+            if company.stats and company.stats.average_rating:
+                rating = float(company.stats.average_rating)
+            industries = list(company.profile.industries) if company.profile else []
+            return PublicSupplier(
+                actor_id=actor.id,
+                kind=actor.kind.value,
+                display_name=actor.display_name or company.title,
+                company_id=company.id,
+                city=company.city,
+                country=company.country,
+                description=company.description,
+                website=company.website,
+                rating=rating,
+                verification_status=company.verification_status.value,
+                reviews_count=reviews_count,
+                industries=industries,
+                active_catalog_count=active_catalog_count,
+                trust_level=actor.trust_level.value,
+            )
+
+        user = actor.user
+        description = None
+        if user:
+            description = f"{user.first_name} {user.last_name}".strip() or None
+        return PublicSupplier(
+            actor_id=actor.id,
+            kind=actor.kind.value,
+            display_name=actor.display_name
+            or (description if description else f"Поставщик #{actor.id}"),
+            company_id=None,
+            city=None,
+            country=None,
+            description=None,
+            website=None,
+            rating=0.0,
+            verification_status="pending",
+            reviews_count=reviews_count,
+            industries=[],
+            active_catalog_count=active_catalog_count,
+            trust_level=actor.trust_level.value,
+        )
 
     async def add_certificate(
         self, company_id: int, user_id: int, data: CertificateCreateRequest

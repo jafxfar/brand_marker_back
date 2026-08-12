@@ -228,7 +228,7 @@ class PaymentService:
         available = 0.0
         pending = 0.0
         escrow_locked = 0.0
-        currency = "RUB"
+        currency = "TJS"
         for contract in await self._supplier_contracts(supplier_actor_id):
             if not contract.payment_plan:
                 continue

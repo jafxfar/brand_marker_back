@@ -18,6 +18,7 @@ def _user_display_name(user) -> str:
 
 
 def _message_to_dict(msg: Message) -> dict:
+    status = getattr(msg, "status", None)
     return {
         "id": msg.id,
         "conversation_id": msg.conversation_id,
@@ -26,6 +27,9 @@ def _message_to_dict(msg: Message) -> dict:
         "text": msg.text,
         "attachment": None,
         "created_at": msg.created_at,
+        "status": status.value if hasattr(status, "value") else (status or "sent"),
+        "delivered_at": getattr(msg, "delivered_at", None),
+        "viewed_at": getattr(msg, "viewed_at", None),
     }
 
 

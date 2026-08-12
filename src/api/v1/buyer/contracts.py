@@ -51,6 +51,29 @@ async def post_message(
     )
 
 
+@router.post("/{contract_id}/messages/read")
+async def mark_messages_read(
+    contract_id: int,
+    ctx: Annotated[BuyerContext, Depends(require_buyer_ctx)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    return await ContractService(db).mark_messages_read(
+        contract_id, ctx.user.id, ctx.actor.id
+    )
+
+
+@router.post("/{contract_id}/messages/{message_id}/delivered")
+async def mark_message_delivered(
+    contract_id: int,
+    message_id: int,
+    ctx: Annotated[BuyerContext, Depends(require_buyer_ctx)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    return await ContractService(db).mark_message_delivered(
+        contract_id, message_id, ctx.user.id, ctx.actor.id
+    )
+
+
 @router.post("/{contract_id}/files")
 async def upload_file(
     contract_id: int,

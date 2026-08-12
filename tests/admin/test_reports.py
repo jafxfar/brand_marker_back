@@ -61,7 +61,7 @@ async def _create_pending_item(client, supplier_auth, admin_auth=None) -> int:
             ],
             "pricing": {
                 "pricing_type": "fixed",
-                "currency": "RUB",
+                "currency": "TJS",
                 "fixed_price": 1500,
                 "hourly_rate": None,
                 "monthly_rate": None,
@@ -327,7 +327,7 @@ async def test_admin_reports_include_rfq_and_proposal(
             "title": "Reports RFQ target",
             "category_id": "it",
             "budget_type": "open",
-            "currency": "RUB",
+            "currency": "TJS",
             "deadline": "2026-12-31",
             "visibility": "public",
             "status": "draft",
@@ -361,7 +361,7 @@ async def test_admin_reports_include_rfq_and_proposal(
         headers=supplier_auth["headers"],
         json={
             "price": 9000,
-            "currency": "RUB",
+            "currency": "TJS",
             "delivery_time": "7 days",
             "message": "Reports proposal target",
         },

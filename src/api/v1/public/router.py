@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.session import get_db
 from src.modules.catalog.schemas import CategoryTree
 from src.modules.catalog.service import CategoryService
-from src.modules.companies.schemas import CompanyWithRelations
+from src.modules.companies.schemas import CompanyWithRelations, PublicSupplier
 from src.modules.companies.service import CompanyService
 from src.modules.catalog_items.service import CatalogItemService
 from src.modules.reviews.schemas import ReviewResponse
@@ -21,13 +21,39 @@ async def list_categories(db: Annotated[AsyncSession, Depends(get_db)]):
     return await CategoryService(db).get_tree()
 
 
-@router.get("/suppliers", response_model=list[CompanyWithRelations])
+@router.get("/suppliers", response_model=list[PublicSupplier])
 async def list_suppliers(
     db: Annotated[AsyncSession, Depends(get_db)],
     q: str | None = Query(None),
     category: str | None = Query(None),
 ):
     return await CompanyService(db).list_suppliers(q, category)
+
+
+@router.get("/suppliers/{actor_id}", response_model=PublicSupplier)
+async def get_supplier(
+    actor_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    return await CompanyService(db).get_public_supplier(actor_id)
+
+
+@router.get("/suppliers/{actor_id}/catalog")
+async def supplier_catalog(
+    actor_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await CompanyService(db).get_public_supplier(actor_id)
+    return await CatalogItemService(db).list_active_for_company_actor(actor_id)
+
+
+@router.get("/suppliers/{actor_id}/reviews", response_model=list[ReviewResponse])
+async def supplier_reviews(
+    actor_id: int,
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await CompanyService(db).get_public_supplier(actor_id)
+    return await ReviewService(db).list_for_actor(actor_id)
 
 
 @router.get("/companies/{company_id}", response_model=CompanyWithRelations)

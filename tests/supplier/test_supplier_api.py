@@ -81,11 +81,11 @@ async def test_supplier_catalog_list(client, supplier_auth):
 
 
 @pytest.mark.asyncio
-async def test_supplier_orders_available(client, supplier_auth):
+async def test_supplier_rfqs_list(client, supplier_auth):
     if not supplier_auth["actor_id"]:
         pytest.skip("No supplier actor")
     res = await client.get(
-        f"{API}/supplier/orders?tab=available",
+        f"{API}/supplier/rfqs/board",
         headers=supplier_auth["headers"],
     )
     assert res.status_code == 200

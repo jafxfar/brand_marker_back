@@ -39,7 +39,7 @@ async def _create_pending_item(client, supplier_auth) -> int:
             ],
             "pricing": {
                 "pricing_type": "fixed",
-                "currency": "RUB",
+                "currency": "TJS",
                 "fixed_price": 1500,
                 "hourly_rate": None,
                 "monthly_rate": None,

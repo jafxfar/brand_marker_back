@@ -44,6 +44,9 @@ class MessageSchema(BaseModel):
     text: str
     attachment: MessageAttachmentSchema | None = None
     created_at: datetime | None = None
+    status: str = "sent"
+    delivered_at: datetime | None = None
+    viewed_at: datetime | None = None
 
 
 class ConversationSchema(BaseModel):

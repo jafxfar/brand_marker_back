@@ -30,7 +30,7 @@ async def _seed_payment(
             status=status,
             gateway=PlatformPaymentGateway.mock,
             actor_id=actor_id,
-            currency="RUB",
+            currency="TJS",
         )
         await db.commit()
         return payment.id

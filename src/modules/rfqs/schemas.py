@@ -77,7 +77,7 @@ class ProductRfqCreate(BaseModel):
     budget_type: str
     budget_from: float | None = None
     budget_to: float | None = None
-    currency: str = "RUB"
+    currency: str = "TJS"
     deadline: str
     visibility: str = "public"
     status: str | None = "draft"
@@ -96,7 +96,7 @@ class ServiceRfqCreate(BaseModel):
     budget_type: str
     budget_from: float | None = None
     budget_to: float | None = None
-    currency: str = "RUB"
+    currency: str = "TJS"
     deadline: str
     visibility: str = "public"
     status: str | None = "draft"
