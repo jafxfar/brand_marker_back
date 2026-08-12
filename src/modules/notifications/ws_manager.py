@@ -23,6 +23,9 @@ class NotificationConnectionManager:
         if not sockets:
             del self._connections[user_id]
 
+    def is_any_online(self, user_ids: list[int]) -> bool:
+        return any(bool(self._connections.get(user_id)) for user_id in user_ids)
+
     async def broadcast_to_users(self, user_ids: list[int], payload: dict) -> None:
         message = json.dumps(payload, default=str)
         for user_id in user_ids:

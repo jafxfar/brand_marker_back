@@ -20,7 +20,7 @@ async def test_individual_buyer_can_create_rfq(client, buyer_auth):
             "title": "Individual RFQ test",
             "category_id": "it",
             "budget_type": "open",
-            "currency": "RUB",
+            "currency": "TJS",
             "deadline": "2026-12-31",
             "visibility": "public",
             "status": "draft",

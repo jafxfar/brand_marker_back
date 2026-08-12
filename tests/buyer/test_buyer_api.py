@@ -27,10 +27,10 @@ async def test_public_catalog(client):
 
 
 @pytest.mark.asyncio
-async def test_buyer_orders_list(client, buyer_auth):
+async def test_buyer_rfqs_list(client, buyer_auth):
     if not buyer_auth["actor_id"]:
         pytest.skip("No buyer actor")
-    res = await client.get(f"{API}/buyer/orders", headers=buyer_auth["headers"])
+    res = await client.get(f"{API}/buyer/rfqs/", headers=buyer_auth["headers"])
     assert res.status_code == 200
     assert isinstance(res.json(), list)
 

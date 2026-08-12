@@ -71,7 +71,7 @@ class SubscriptionService:
             await FinanceLedgerService(self.db).record(
                 payment_type=PlatformPaymentType.subscription,
                 amount=amount,
-                currency="RUB",
+                currency="TJS",
                 title=f"Подписка {plan}",
                 description=f"Активация тарифа {plan} на 30 дней",
                 status=PlatformPaymentStatus.paid,

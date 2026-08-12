@@ -88,7 +88,7 @@ class ItemAttributeInput(BaseModel):
 
 class ItemPricingInput(BaseModel):
     pricing_type: str
-    currency: str = "RUB"
+    currency: str = "TJS"
     fixed_price: float | None = None
     hourly_rate: float | None = None
     monthly_rate: float | None = None

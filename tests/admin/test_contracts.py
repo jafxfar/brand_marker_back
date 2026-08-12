@@ -29,7 +29,7 @@ async def _create_draft_rfq(client, buyer_auth, title: str = "Admin contract RFQ
             "title": title,
             "category_id": "it",
             "budget_type": "open",
-            "currency": "RUB",
+            "currency": "TJS",
             "deadline": "2026-12-31",
             "visibility": "public",
             "status": "draft",
@@ -54,7 +54,7 @@ async def _create_contract(client, buyer_auth, supplier_auth, title: str) -> int
         headers=supplier_auth["headers"],
         json={
             "price": 15000,
-            "currency": "RUB",
+            "currency": "TJS",
             "delivery_time": "14 days",
             "message": "Готовы выполнить контракт",
         },

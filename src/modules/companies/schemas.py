@@ -163,3 +163,20 @@ class CertificateCreateRequest(BaseModel):
     issue_date: str
     expiry_date: str | None = None
     file_url: str
+
+
+class PublicSupplier(BaseModel):
+    actor_id: int
+    kind: str
+    display_name: str
+    company_id: int | None = None
+    city: str | None = None
+    country: str | None = None
+    description: str | None = None
+    website: str | None = None
+    rating: float = 0.0
+    verification_status: str = "pending"
+    reviews_count: int = 0
+    industries: list[str] = []
+    active_catalog_count: int = 0
+    trust_level: str = "basic"

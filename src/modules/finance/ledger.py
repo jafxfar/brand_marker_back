@@ -29,7 +29,7 @@ class FinanceLedgerService:
         title: str,
         status: PlatformPaymentStatus = PlatformPaymentStatus.pending,
         gateway: PlatformPaymentGateway = PlatformPaymentGateway.manual,
-        currency: str = "RUB",
+        currency: str = "TJS",
         commission: float = 0.0,
         description: str | None = None,
         actor_id: int | None = None,

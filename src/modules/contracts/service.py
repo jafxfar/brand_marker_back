@@ -16,6 +16,7 @@ from src.models import (
     Dispute,
     DisputeStatus,
     Message,
+    MessageDeliveryStatus,
     PaymentMilestone,
     PaymentMilestoneStatus,
     PaymentMilestoneTrigger,
@@ -239,6 +240,49 @@ class ContractService:
             return [row[0] for row in members.all()]
         return []
 
+    def _message_payload(self, contract_id: int, msg: Message, sender_name: str | None = None) -> dict:
+        name = sender_name
+        if name is None:
+            sender = getattr(msg, "sender", None)
+            if sender:
+                name = f"{sender.first_name} {sender.last_name}".strip() or sender.email
+            else:
+                name = f"User #{msg.sender_id}"
+        return {
+            "id": msg.id,
+            "conversation_id": msg.conversation_id,
+            "sender_id": msg.sender_id,
+            "sender_name": name or f"User #{msg.sender_id}",
+            "text": msg.text,
+            "attachment": None,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
+            "status": msg.status.value if hasattr(msg.status, "value") else (msg.status or "sent"),
+            "delivered_at": msg.delivered_at.isoformat() if msg.delivered_at else None,
+            "viewed_at": msg.viewed_at.isoformat() if msg.viewed_at else None,
+        }
+
+    async def _broadcast_message_event(
+        self,
+        contract: Contract,
+        actor_id: int,
+        event: str,
+        payload_data: dict,
+    ) -> None:
+        recipient_actor_id = (
+            contract.supplier_actor_id
+            if actor_id == contract.buyer_actor_id
+            else contract.buyer_actor_id
+        )
+        recipient_user_ids = await self._resolve_actor_user_ids(recipient_actor_id)
+        sender_user_ids = await self._resolve_actor_user_ids(actor_id)
+        all_user_ids = list(set(recipient_user_ids + sender_user_ids))
+        if not all_user_ids:
+            return
+        await notification_ws_manager.broadcast_to_users(
+            all_user_ids,
+            {"event": event, "data": payload_data},
+        )
+
     async def add_message(self, contract_id: int, user_id: int, actor_id: int, data: MessageCreate):
         contract = await self._load(contract_id)
         if contract.buyer_actor_id != actor_id and contract.supplier_actor_id != actor_id:
@@ -246,10 +290,13 @@ class ContractService:
         if not contract.conversation:
             contract.conversation = Conversation(contract_id=contract_id)
             await self.db.flush()
+
+        now = datetime.now(timezone.utc)
         msg = Message(
             conversation_id=contract.conversation.id,
             sender_id=user_id,
             text=data.text,
+            status=MessageDeliveryStatus.sent,
         )
         self.db.add(msg)
         await self.db.flush()
@@ -267,27 +314,90 @@ class ContractService:
             else contract.buyer_actor_id
         )
         recipient_user_ids = await self._resolve_actor_user_ids(recipient_actor_id)
-        sender_user_ids = await self._resolve_actor_user_ids(actor_id)
-        all_user_ids = list(set(recipient_user_ids + sender_user_ids))
-        if all_user_ids:
-            await notification_ws_manager.broadcast_to_users(
-                all_user_ids,
-                {
-                    "event": "contract.message",
-                    "data": {
-                        "contract_id": contract_id,
-                        "message": {
-                            "id": msg.id,
-                            "sender_id": user_id,
-                            "sender_name": sender_name or f"User #{user_id}",
-                            "text": msg.text,
-                            "created_at": msg.created_at.isoformat() if msg.created_at else None,
-                        },
-                    },
-                },
-            )
+        if notification_ws_manager.is_any_online(recipient_user_ids):
+            msg.status = MessageDeliveryStatus.delivered
+            msg.delivered_at = now
+            await self.db.flush()
+
+        await self._broadcast_message_event(
+            contract,
+            actor_id,
+            "contract.message",
+            {
+                "contract_id": contract_id,
+                "message": self._message_payload(contract_id, msg, sender_name),
+            },
+        )
 
         return contract_to_schema(await self._load(contract_id))
+
+    async def mark_message_delivered(
+        self, contract_id: int, message_id: int, user_id: int, actor_id: int
+    ):
+        contract = await self._load(contract_id)
+        if contract.buyer_actor_id != actor_id and contract.supplier_actor_id != actor_id:
+            raise ForbiddenError("Access denied")
+        if not contract.conversation:
+            raise NotFoundError("Conversation not found")
+        msg = next(
+            (m for m in contract.conversation.messages if m.id == message_id),
+            None,
+        )
+        if not msg:
+            raise NotFoundError("Message not found")
+        if msg.sender_id == user_id:
+            raise ForbiddenError("Cannot acknowledge own message")
+        if msg.status == MessageDeliveryStatus.sent:
+            msg.status = MessageDeliveryStatus.delivered
+            msg.delivered_at = datetime.now(timezone.utc)
+            await self.db.flush()
+            await self._broadcast_message_event(
+                contract,
+                actor_id,
+                "contract.message.status",
+                {
+                    "contract_id": contract_id,
+                    "message": self._message_payload(contract_id, msg),
+                },
+            )
+        return self._message_payload(contract_id, msg)
+
+    async def mark_messages_read(self, contract_id: int, user_id: int, actor_id: int):
+        contract = await self._load(contract_id)
+        if contract.buyer_actor_id != actor_id and contract.supplier_actor_id != actor_id:
+            raise ForbiddenError("Access denied")
+        if not contract.conversation:
+            return {"message_ids": []}
+
+        now = datetime.now(timezone.utc)
+        updated: list[Message] = []
+        for msg in contract.conversation.messages:
+            if msg.sender_id == user_id:
+                continue
+            if msg.status == MessageDeliveryStatus.viewed:
+                continue
+            if msg.status == MessageDeliveryStatus.sent:
+                msg.delivered_at = msg.delivered_at or now
+            msg.status = MessageDeliveryStatus.viewed
+            msg.viewed_at = now
+            updated.append(msg)
+
+        if not updated:
+            return {"message_ids": []}
+
+        await self.db.flush()
+        payloads = [self._message_payload(contract_id, msg) for msg in updated]
+        await self._broadcast_message_event(
+            contract,
+            actor_id,
+            "contract.message.status",
+            {
+                "contract_id": contract_id,
+                "messages": payloads,
+                "message": payloads[0],
+            },
+        )
+        return {"message_ids": [m.id for m in updated], "messages": payloads}
 
     async def add_file(
         self, contract_id: int, user_id: int, actor_id: int, file_name: str, file_url: str, file_type: str

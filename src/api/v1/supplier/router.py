@@ -7,7 +7,6 @@ from src.api.v1.supplier import (
     contracts,
     finance,
     notifications,
-    orders,
     payments,
     proposals,
     rfqs,
@@ -19,7 +18,6 @@ router = APIRouter(prefix="/supplier", dependencies=[Depends(require_supplier_ct
 router.include_router(companies.router)
 router.include_router(catalog.router)
 router.include_router(subscription.router)
-router.include_router(orders.router)
 router.include_router(finance.router)
 router.include_router(rfqs.router)
 router.include_router(proposals.router)

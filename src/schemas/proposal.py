@@ -33,7 +33,7 @@ class ProposalWithRelations(ProposalSchema):
 
 class ProposalCreate(BaseModel):
     price: float = Field(gt=0)
-    currency: str = "RUB"
+    currency: str = "TJS"
     delivery_time: str | None = None
     message: str | None = None
 

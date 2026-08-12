@@ -445,7 +445,7 @@ def _ensure_admin_finance_schema_sync(sync_conn) -> None:
                 gateway platform_payment_gateway NOT NULL DEFAULT 'manual',
                 amount DOUBLE PRECISION NOT NULL,
                 commission DOUBLE PRECISION NOT NULL DEFAULT 0,
-                currency VARCHAR(10) NOT NULL DEFAULT 'RUB',
+                currency VARCHAR(10) NOT NULL DEFAULT 'TJS',
                 title VARCHAR(255) NOT NULL,
                 description TEXT,
                 actor_id INTEGER REFERENCES actors(id),
