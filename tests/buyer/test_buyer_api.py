@@ -1,6 +1,38 @@
 import pytest
+from sqlalchemy import select
+
+from src.db.session import AsyncSessionLocal
+from src.models import Rfq, RfqStatus
 
 API = "/api/v1"
+
+
+async def _create_draft_rfq(client, buyer_auth, title: str) -> str:
+    res = await client.post(
+        f"{API}/buyer/rfqs/",
+        headers=buyer_auth["headers"],
+        json={
+            "type": "service",
+            "title": title,
+            "category_id": "it",
+            "budget_type": "open",
+            "currency": "TJS",
+            "deadline": "2026-12-31",
+            "visibility": "public",
+            "status": "draft",
+            "project_duration": "2 months",
+            "start_date": "2026-07-01",
+        },
+    )
+    assert res.status_code == 200, res.text
+    return res.json()["id"]
+
+
+async def _set_rfq_status(rfq_id: str, status: RfqStatus) -> None:
+    async with AsyncSessionLocal() as db:
+        rfq = (await db.execute(select(Rfq).where(Rfq.id == rfq_id))).scalar_one()
+        rfq.status = status
+        await db.commit()
 
 
 @pytest.mark.asyncio
@@ -33,6 +65,44 @@ async def test_buyer_rfqs_list(client, buyer_auth):
     res = await client.get(f"{API}/buyer/rfqs/", headers=buyer_auth["headers"])
     assert res.status_code == 200
     assert isinstance(res.json(), list)
+
+
+@pytest.mark.asyncio
+async def test_buyer_rfqs_list_all_and_filter_by_status(client, buyer_auth):
+    if not buyer_auth["actor_id"]:
+        pytest.skip("No buyer actor")
+
+    draft_id = await _create_draft_rfq(client, buyer_auth, "Buyer list draft RFQ")
+    completed_id = await _create_draft_rfq(client, buyer_auth, "Buyer list completed RFQ")
+    await _set_rfq_status(completed_id, RfqStatus.completed)
+
+    all_res = await client.get(f"{API}/buyer/rfqs/", headers=buyer_auth["headers"])
+    assert all_res.status_code == 200, all_res.text
+    all_ids = {item["id"] for item in all_res.json()}
+    assert draft_id in all_ids
+    assert completed_id in all_ids
+
+    draft_res = await client.get(
+        f"{API}/buyer/rfqs/",
+        params={"tab": "draft"},
+        headers=buyer_auth["headers"],
+    )
+    assert draft_res.status_code == 200, draft_res.text
+    draft_items = draft_res.json()
+    assert all(item["status"] == "draft" for item in draft_items)
+    assert draft_id in {item["id"] for item in draft_items}
+    assert completed_id not in {item["id"] for item in draft_items}
+
+    completed_res = await client.get(
+        f"{API}/buyer/rfqs/",
+        params={"tab": "completed"},
+        headers=buyer_auth["headers"],
+    )
+    assert completed_res.status_code == 200, completed_res.text
+    completed_items = completed_res.json()
+    assert all(item["status"] == "completed" for item in completed_items)
+    assert completed_id in {item["id"] for item in completed_items}
+    assert draft_id not in {item["id"] for item in completed_items}
 
 
 @pytest.mark.asyncio

@@ -86,8 +86,15 @@ class RfqService:
         ).options(
             selectinload(Rfq.attachments), selectinload(Rfq.invited_suppliers)
         )
-        if tab and tab in BUYER_TAB_STATUSES:
+        if tab == "all" or not tab:
+            pass
+        elif tab in BUYER_TAB_STATUSES:
             stmt = stmt.where(Rfq.status.in_(BUYER_TAB_STATUSES[tab]))
+        else:
+            try:
+                stmt = stmt.where(Rfq.status == RfqStatus(tab))
+            except ValueError:
+                pass
         result = await self.db.execute(stmt.order_by(Rfq.updated_at.desc()))
         return [rfq_to_response(r) for r in result.scalars().all()]
 
