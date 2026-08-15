@@ -329,6 +329,9 @@ class ContractService:
             },
         )
 
+        if msg not in contract.conversation.messages:
+            contract.conversation.messages.append(msg)
+        self.db.expire(contract.conversation, ["messages"])
         return contract_to_schema(await self._load(contract_id))
 
     async def mark_message_delivered(

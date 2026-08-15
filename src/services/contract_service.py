@@ -192,6 +192,9 @@ class ContractService:
         )
         self.db.add(msg)
         await self.db.flush()
+        if msg not in contract.conversation.messages:
+            contract.conversation.messages.append(msg)
+        self.db.expire(contract.conversation, ["messages"])
         return contract_to_schema(await self._load(contract_id))
 
     async def add_file(
