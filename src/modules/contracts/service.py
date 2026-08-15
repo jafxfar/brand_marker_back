@@ -332,6 +332,7 @@ class ContractService:
             sender_id=user_id,
             text=data.text,
             status=MessageDeliveryStatus.sent,
+            status=MessageDeliveryStatus.sent,
         )
         self.db.add(msg)
         await self.db.flush()
@@ -349,6 +350,22 @@ class ContractService:
             else contract.buyer_actor_id
         )
         recipient_user_ids = await self._resolve_actor_user_ids(recipient_actor_id)
+        if notification_ws_manager.is_any_online(recipient_user_ids):
+            msg.status = MessageDeliveryStatus.delivered
+            msg.delivered_at = now
+            await self.db.flush()
+
+        await self._broadcast_message_event(
+            contract,
+            actor_id,
+            "contract.message",
+            {
+                "contract_id": contract_id,
+                "message": self._message_payload(contract_id, msg, sender_name),
+            },
+        )
+
+        return contract_to_schema(await self._load(contract_id))
         if notification_ws_manager.is_any_online(recipient_user_ids):
             msg.status = MessageDeliveryStatus.delivered
             msg.delivered_at = now
