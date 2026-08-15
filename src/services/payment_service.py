@@ -65,6 +65,8 @@ class PaymentService:
         contract = result.scalar_one_or_none()
         if not contract or contract.buyer_actor_id != buyer_id:
             raise ForbiddenError("Access denied")
+        if milestone.status == PaymentMilestoneStatus.funded:
+            return milestone
         if milestone.status not in (
             PaymentMilestoneStatus.pending,
             PaymentMilestoneStatus.awaiting_payment,
@@ -151,7 +153,20 @@ class PaymentService:
         return items
 
     async def mock_confirm_payment(self, milestone_id: int, buyer_id: int) -> dict:
-        milestone = await self.fund_milestone(milestone_id, buyer_id)
+        result = await self.db.execute(
+            select(PaymentMilestone).where(PaymentMilestone.id == milestone_id)
+        )
+        existing = result.scalar_one_or_none()
+        if existing and existing.status == PaymentMilestoneStatus.funded:
+            result = await self.db.execute(
+                select(Contract).where(Contract.id == existing.contract_id)
+            )
+            contract = result.scalar_one_or_none()
+            if not contract or contract.buyer_actor_id != buyer_id:
+                raise ForbiddenError("Access denied")
+            milestone = existing
+        else:
+            milestone = await self.fund_milestone(milestone_id, buyer_id)
         return {
             "status": "confirmed",
             "milestone_id": milestone.id,

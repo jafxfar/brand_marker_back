@@ -1,6 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
+
+from src.utils.storage import FileUrlMixin, public_file_url
 
 
 class CompanyProfileSchema(BaseModel):
@@ -32,7 +34,7 @@ class CompanyStatsSchema(BaseModel):
     average_rating: float
 
 
-class CompanyCertificateSchema(BaseModel):
+class CompanyCertificateSchema(FileUrlMixin):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -87,6 +89,12 @@ class CompanySchema(BaseModel):
     rating: float
     created_at: datetime
     updated_at: datetime
+
+    @field_serializer("logo")
+    def serialize_logo(self, value: str | None) -> str | None:
+        if not value:
+            return value
+        return public_file_url(value)
 
 
 class CompanyWithRelations(CompanySchema):

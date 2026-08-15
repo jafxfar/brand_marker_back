@@ -82,9 +82,9 @@ async def upload_attachment(
     db: Annotated[AsyncSession, Depends(get_db)],
     file: UploadFile = File(...),
 ):
-    _, url = await storage_service.upload(file, f"rfqs/{rfq_id}")
+    key, _ = await storage_service.upload(file, f"rfqs/{rfq_id}")
     return await RfqService(db).add_attachment(
-        rfq_id, ctx.actor.id, file.filename or "file", url, file.content_type or "application/octet-stream"
+        rfq_id, ctx.actor.id, file.filename or "file", key, file.content_type or "application/octet-stream"
     )
 
 

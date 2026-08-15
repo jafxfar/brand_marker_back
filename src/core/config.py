@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
 
     secret_key: str = "change-me-to-a-long-random-secret-key-in-production"
-    access_token_expire_minutes: int = 15
+    access_token_expire_minutes: int = 60
     refresh_token_expire_days: int = 7
     bcrypt_rounds: int = 12
     algorithm: str = "HS256"
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     s3_bucket: str = "brandmarket"
     s3_region: str = "us-east-1"
     s3_use_ssl: bool = False
+    files_base_url: str = "http://localhost:9000/brandmarket"
     local_upload_dir: str = "./uploads"
 
     max_upload_size_mb: int = 50

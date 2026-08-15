@@ -65,6 +65,22 @@ class CompanyService:
             return [ActorType(data.actor_type)]
         return [ActorType.buyer]
 
+    async def _ensure_roles_and_actors(self, user: User, actor_types: list[ActorType]) -> None:
+        for side in actor_types:
+            if side == ActorType.buyer and user.role == UserRole.supplier:
+                user.role = UserRole.both
+            elif side == ActorType.supplier and user.role == UserRole.buyer:
+                user.role = UserRole.both
+            elif side == ActorType.buyer and user.role not in (UserRole.buyer, UserRole.both):
+                user.role = UserRole.buyer
+            elif side == ActorType.supplier and user.role not in (UserRole.supplier, UserRole.both):
+                user.role = UserRole.supplier
+        user.updated_at = datetime.now(timezone.utc)
+        await self.db.flush()
+        actor_svc = ActorService(self.db)
+        for side in actor_types:
+            await actor_svc.ensure_individual_actor(user, side)
+
     async def create_from_wizard(
         self, user: User, data: CompanyWizardInput, actor_type: ActorType | None = None
     ) -> CompanyWithRelations:
@@ -72,11 +88,7 @@ class CompanyService:
         if actor_type and actor_type not in actor_types:
             actor_types = [actor_type, *actor_types]
 
-        for at in actor_types:
-            if at == ActorType.buyer and user.role not in (UserRole.buyer, UserRole.both):
-                raise ForbiddenError("User cannot create buyer company")
-            if at == ActorType.supplier and user.role not in (UserRole.supplier, UserRole.both):
-                raise ForbiddenError("User cannot create supplier company")
+        await self._ensure_roles_and_actors(user, actor_types)
 
         primary_type = actor_types[0]
         company = Company(

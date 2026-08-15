@@ -17,6 +17,21 @@ uvicorn src.main:app --reload --port 8000
 
 API docs: http://localhost:8000/docs
 
+## File storage
+
+Uploads go to S3-compatible storage (MinIO locally, Cloudflare R2 or AWS S3 in production). The API stores the **object key** and returns a public URL built from `FILES_BASE_URL`.
+
+| Environment | `S3_ENDPOINT_URL` (backend SDK) | `FILES_BASE_URL` (browser) |
+|-------------|----------------------------------|----------------------------|
+| Local uvicorn + MinIO | `http://localhost:9000` | `http://localhost:9000/brandmarket` |
+| Docker Compose | `http://minio:9000` | `http://localhost:9000/brandmarket` |
+| Render + Cloudflare R2 | `https://<accountid>.r2.cloudflarestorage.com` | `https://pub-XXXX.r2.dev` or a custom domain |
+| AWS S3 / CloudFront | AWS default | bucket website URL or CloudFront |
+
+Render disk is ephemeral — do not rely on `/uploads` there. Set `S3_*` and `FILES_BASE_URL` on the Render service.
+
+Frontend: `NEXT_PUBLIC_FILES_BASE_URL` (same public prefix) for relative/legacy paths. Absolute `https://` URLs from the API are used as-is.
+
 ## API prefixes
 
 | Prefix | Audience |

@@ -23,6 +23,8 @@ from src.models import (
     PaymentPlan,
     PaymentType,
     Proposal,
+    Rfq,
+    RfqAttachment,
     RfqStatus,
     WorkSubmission,
     WorkSubmissionStatus,
@@ -157,6 +159,7 @@ class ContractService:
         buyer_actor_id: int,
         payment_type: PaymentType | None = None,
         milestones: list[dict] | None = None,
+        buyer_user_id: int | None = None,
     ) -> Contract:
         rfq = proposal.rfq
         if payment_type is None:
@@ -199,7 +202,39 @@ class ContractService:
         conv = Conversation(contract_id=contract.id)
         self.db.add(conv)
         await self.db.flush()
+        await self._copy_rfq_attachments(contract, rfq, buyer_actor_id, buyer_user_id)
         return contract
+
+    async def _copy_rfq_attachments(
+        self,
+        contract: Contract,
+        rfq: Rfq,
+        buyer_actor_id: int,
+        buyer_user_id: int | None,
+    ) -> None:
+        result = await self.db.execute(
+            select(RfqAttachment).where(RfqAttachment.rfq_id == rfq.id)
+        )
+        attachments = list(result.scalars().all())
+        if not attachments:
+            return
+        uploaded_by = buyer_user_id
+        if uploaded_by is None:
+            user_ids = await self._resolve_actor_user_ids(buyer_actor_id)
+            uploaded_by = user_ids[0] if user_ids else None
+        if uploaded_by is None:
+            raise ConflictError("Cannot copy RFQ attachments: buyer user not found")
+        for attachment in attachments:
+            self.db.add(
+                ContractFile(
+                    contract_id=contract.id,
+                    file_name=attachment.file_name,
+                    file_url=attachment.file_url,
+                    file_type=attachment.file_type,
+                    uploaded_by=uploaded_by,
+                )
+            )
+        await self.db.flush()
 
     async def list_for_actor(self, actor_id: int, actor_type: str) -> list:
         if actor_type == "buyer":

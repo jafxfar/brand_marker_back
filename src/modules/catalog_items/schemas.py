@@ -2,6 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.utils.storage import FileUrlMixin
+
 
 class ItemAttributeSchema(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -32,7 +34,7 @@ class ItemPricingSchema(BaseModel):
     tiers: list[ItemPricingTierSchema] = []
 
 
-class ItemMediaSchema(BaseModel):
+class ItemMediaSchema(FileUrlMixin):
     model_config = ConfigDict(from_attributes=True)
 
     id: int

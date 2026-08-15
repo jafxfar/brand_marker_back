@@ -81,13 +81,13 @@ async def upload_file(
     db: Annotated[AsyncSession, Depends(get_db)],
     file: UploadFile = File(...),
 ):
-    _, url = await storage_service.upload(file, f"contracts/{contract_id}")
+    key, _ = await storage_service.upload(file, f"contracts/{contract_id}")
     return await ContractService(db).add_file(
         contract_id,
         ctx.user.id,
         ctx.actor.id,
         file.filename or "file",
-        url,
+        key,
         file.content_type or "application/octet-stream",
     )
 

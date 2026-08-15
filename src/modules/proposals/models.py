@@ -1,3 +1,3 @@
-from src.models import Proposal, ProposalAttachment
+from src.models import Proposal, ProposalAttachment, ProposalMessage
 
-__all__ = ["Proposal", "ProposalAttachment"]
+__all__ = ["Proposal", "ProposalAttachment", "ProposalMessage"]

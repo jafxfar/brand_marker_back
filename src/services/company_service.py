@@ -18,6 +18,7 @@ from src.models import (
     UserRole,
     VerificationStatus,
 )
+from src.modules.actors.service import ActorService
 from src.schemas.company import (
     AddTeamMemberRequest,
     CertificateCreateRequest,
@@ -54,10 +55,27 @@ class CompanyService:
         self, user: User, data: CompanyWizardInput, actor_type: ActorType | None = None
     ) -> CompanyWithRelations:
         at = actor_type or ActorType(data.actor_type)
-        if at == ActorType.buyer and user.role not in (UserRole.buyer, UserRole.both):
-            raise ForbiddenError("User cannot create buyer company")
-        if at == ActorType.supplier and user.role not in (UserRole.supplier, UserRole.both):
-            raise ForbiddenError("User cannot create supplier company")
+        actor_types = [at]
+        extra = getattr(data, "actor_types", None) or []
+        for t in extra:
+            parsed = ActorType(t)
+            if parsed not in actor_types:
+                actor_types.append(parsed)
+
+        for side in actor_types:
+            if side == ActorType.buyer and user.role == UserRole.supplier:
+                user.role = UserRole.both
+            elif side == ActorType.supplier and user.role == UserRole.buyer:
+                user.role = UserRole.both
+            elif side == ActorType.buyer and user.role not in (UserRole.buyer, UserRole.both):
+                user.role = UserRole.buyer
+            elif side == ActorType.supplier and user.role not in (UserRole.supplier, UserRole.both):
+                user.role = UserRole.supplier
+        user.updated_at = datetime.now(timezone.utc)
+        await self.db.flush()
+        actor_svc = ActorService(self.db)
+        for side in actor_types:
+            await actor_svc.ensure_individual_actor(user, side)
 
         company = Company(
             title=data.title,

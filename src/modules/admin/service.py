@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.core.exceptions import ConflictError, ForbiddenError, NotFoundError, ValidationError
+from src.utils.storage import public_file_url
 from src.models import (
     Actor,
     ActorKind,
@@ -301,7 +302,7 @@ class AdminService:
                     "issuer": certificate.issuer,
                     "issue_date": certificate.issue_date,
                     "expiry_date": certificate.expiry_date,
-                    "file_url": certificate.file_url,
+                    "file_url": public_file_url(certificate.file_url),
                 }
                 for certificate in company.certificates
             ],
@@ -463,7 +464,7 @@ class AdminService:
             },
             "legal_name": company.legal_name,
             "tax_number": company.tax_number,
-            "logo": company.logo,
+            "logo": public_file_url(company.logo) if company.logo else company.logo,
             "country": company.country,
             "city": company.city,
             "verification_status": company.verification_status.value,
@@ -673,7 +674,7 @@ class AdminService:
                 {
                     "id": media.id,
                     "file_name": media.file_name,
-                    "file_url": media.file_url,
+                    "file_url": public_file_url(media.file_url),
                     "media_type": media.media_type.value,
                     "sort_order": media.sort_order,
                 }
@@ -906,7 +907,7 @@ class AdminService:
             "type": item.type.value,
             "status": item.status.value,
             "category_name": item.category.name if item.category else None,
-            "preview_url": preview,
+            "preview_url": public_file_url(preview) if preview else preview,
             "open_reports_count": open_reports,
             "owner": owner,
             "created_at": item.created_at,
@@ -1319,7 +1320,7 @@ class AdminService:
                 {
                     "id": item.id,
                     "file_name": item.file_name,
-                    "file_url": item.file_url,
+                    "file_url": public_file_url(item.file_url),
                     "file_type": item.file_type,
                     "note": item.note,
                     "uploaded_by_actor_id": item.uploaded_by_actor_id,
@@ -1333,7 +1334,7 @@ class AdminService:
                 {
                     "id": file.id,
                     "file_name": file.file_name,
-                    "file_url": file.file_url,
+                    "file_url": public_file_url(file.file_url),
                     "file_type": file.file_type,
                     "uploaded_by": file.uploaded_by,
                     "created_at": file.created_at,
@@ -1797,7 +1798,7 @@ class AdminService:
                     {
                         "id": attachment.id,
                         "file_name": attachment.file_name,
-                        "file_url": attachment.file_url,
+                        "file_url": public_file_url(attachment.file_url),
                         "file_type": attachment.file_type,
                     }
                     for attachment in rfq.attachments
@@ -2116,7 +2117,7 @@ class AdminService:
                 {
                     "id": proposal.attachment.id,
                     "file_name": proposal.attachment.file_name,
-                    "file_url": proposal.attachment.file_url,
+                    "file_url": public_file_url(proposal.attachment.file_url),
                     "file_type": proposal.attachment.file_type,
                 }
                 if proposal.attachment
@@ -2607,7 +2608,7 @@ class AdminService:
                 {
                     "id": file.id,
                     "file_name": file.file_name,
-                    "file_url": file.file_url,
+                    "file_url": public_file_url(file.file_url),
                     "file_type": file.file_type,
                     "uploaded_by": file.uploaded_by,
                     "created_at": file.created_at,
@@ -3819,7 +3820,7 @@ class AdminService:
                 files.append(
                     {
                         "file_name": media.file_name,
-                        "file_url": media.file_url,
+                        "file_url": public_file_url(media.file_url),
                         "file_type": media.media_type.value,
                     }
                 )
@@ -3828,7 +3829,7 @@ class AdminService:
                 files.append(
                     {
                         "file_name": attachment.file_name,
-                        "file_url": attachment.file_url,
+                        "file_url": public_file_url(attachment.file_url),
                         "file_type": attachment.file_type,
                     }
                 )
@@ -3836,7 +3837,7 @@ class AdminService:
             files.append(
                 {
                     "file_name": target.attachment.file_name,
-                    "file_url": target.attachment.file_url,
+                    "file_url": public_file_url(target.attachment.file_url),
                     "file_type": target.attachment.file_type,
                 }
             )

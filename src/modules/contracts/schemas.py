@@ -1,6 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
+
+from src.utils.storage import FileUrlMixin, public_file_url
 
 
 class PaymentMilestoneSchema(BaseModel):
@@ -24,7 +26,7 @@ class PaymentPlanSchema(BaseModel):
     milestones: list[PaymentMilestoneSchema] = []
 
 
-class MessageAttachmentSchema(BaseModel):
+class MessageAttachmentSchema(FileUrlMixin):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -57,7 +59,7 @@ class ConversationSchema(BaseModel):
     messages: list[MessageSchema] = []
 
 
-class ContractFileSchema(BaseModel):
+class ContractFileSchema(FileUrlMixin):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -74,6 +76,10 @@ class SubmissionAssetSchema(BaseModel):
     name: str
     url: str
     file_type: str | None = None
+
+    @field_serializer("url")
+    def serialize_url(self, value: str) -> str:
+        return public_file_url(value)
 
 
 class WorkSubmissionSchema(BaseModel):

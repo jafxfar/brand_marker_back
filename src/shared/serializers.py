@@ -8,7 +8,7 @@ from src.modules.companies.schemas import (
     CompanyWithRelations,
     ReviewSchema,
 )
-
+from src.utils.storage import public_file_url
 
 def _user_display_name(user) -> str:
     if not user:
@@ -48,7 +48,7 @@ def _submission_assets(submission) -> list[dict]:
             {
                 "kind": kind,
                 "name": name,
-                "url": url,
+                "url": public_file_url(url),
                 "file_type": item.get("file_type"),
             }
         )
@@ -150,7 +150,7 @@ def rfq_to_response(rfq: Rfq, *, include_buyer: bool = False) -> dict:
                 "id": a.id,
                 "rfq_id": a.rfq_id,
                 "file_name": a.file_name,
-                "file_url": a.file_url,
+                "file_url": public_file_url(a.file_url),
                 "file_type": a.file_type,
             }
             for a in rfq.attachments
@@ -196,7 +196,7 @@ def proposal_to_schema(proposal: Proposal) -> dict:
             "id": proposal.attachment.id,
             "proposal_id": proposal.attachment.proposal_id,
             "file_name": proposal.attachment.file_name,
-            "file_url": proposal.attachment.file_url,
+            "file_url": public_file_url(proposal.attachment.file_url),
             "file_type": proposal.attachment.file_type,
         }
     return data
@@ -253,7 +253,7 @@ def contract_to_schema(contract: Contract) -> dict:
                 "id": f.id,
                 "contract_id": f.contract_id,
                 "file_name": f.file_name,
-                "file_url": f.file_url,
+                "file_url": public_file_url(f.file_url),
                 "file_type": f.file_type,
                 "uploaded_by": f.uploaded_by,
                 "created_at": f.created_at,

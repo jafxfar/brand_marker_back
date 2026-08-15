@@ -29,6 +29,7 @@ from src.modules.catalog_items.schemas import (
     CategoryRefSchema,
     ItemStatsSchema,
 )
+from src.utils.storage import public_file_url
 
 SUPPLIER_WRITABLE_STATUSES = {
     ItemStatus.draft,
@@ -92,7 +93,7 @@ def _item_to_schema(item: CatalogItem) -> CatalogItemWithRelations:
                 "id": m.id,
                 "item_id": m.item_id,
                 "file_name": m.file_name,
-                "file_url": m.file_url,
+                "file_url": public_file_url(m.file_url),
                 "media_type": m.media_type.value,
                 "sort_order": m.sort_order,
             }

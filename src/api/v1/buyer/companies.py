@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.deps import BuyerContext, require_buyer_ctx
 from src.db.session import get_db
+from src.models import ActorType
 from src.modules.companies.schemas import (
     AddTeamMemberRequest,
     CertificateCreateRequest,
@@ -23,7 +24,7 @@ async def create_company(
     ctx: Annotated[BuyerContext, Depends(require_buyer_ctx)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    return await CompanyService(db).create_from_wizard(ctx.user, data)
+    return await CompanyService(db).create_from_wizard(ctx.user, data, ActorType.buyer)
 
 
 @router.get("/me", response_model=list[CompanyWithRelations])

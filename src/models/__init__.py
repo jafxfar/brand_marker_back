@@ -462,6 +462,7 @@ class Proposal(Base):
     )
     contract: Mapped["Contract | None"] = relationship(back_populates="proposal", uselist=False)
     reports: Mapped[list["ProposalReport"]] = relationship(back_populates="proposal")
+    chat_messages: Mapped[list["ProposalMessage"]] = relationship(back_populates="proposal")
 
 
 class ProposalReport(Base):
@@ -507,6 +508,19 @@ class ProposalAttachment(Base):
     file_type: Mapped[str] = mapped_column(String(100))
 
     proposal: Mapped["Proposal"] = relationship(back_populates="attachment")
+
+
+class ProposalMessage(Base):
+    __tablename__ = "proposal_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    proposal_id: Mapped[int] = mapped_column(ForeignKey("proposals.id"), index=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    proposal: Mapped["Proposal"] = relationship(back_populates="chat_messages")
+    sender: Mapped["User"] = relationship(foreign_keys=[sender_id])
 
 
 class PaymentType(str, enum.Enum):

@@ -3,8 +3,10 @@ from typing import Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.utils.storage import FileUrlMixin
 
-class RfqAttachmentSchema(BaseModel):
+
+class RfqAttachmentSchema(FileUrlMixin):
     model_config = ConfigDict(from_attributes=True)
 
     id: str

@@ -3,9 +3,10 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from src.models import PaymentMilestoneTrigger, PaymentType
+from src.utils.storage import FileUrlMixin
 
 
-class ProposalAttachmentSchema(BaseModel):
+class ProposalAttachmentSchema(FileUrlMixin):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -51,6 +52,21 @@ class MilestoneInput(BaseModel):
     title: str = Field(min_length=1)
     percentage: float = Field(gt=0, le=100)
     trigger: PaymentMilestoneTrigger
+
+
+class ProposalMessageSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    proposal_id: int
+    sender_id: int
+    sender_name: str = ""
+    text: str
+    created_at: datetime
+
+
+class ProposalMessageCreate(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
 
 
 class ProposalAcceptRequest(BaseModel):
